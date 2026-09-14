@@ -1,7 +1,7 @@
 <!doctype html>
 <html lang="fr">
 <head>
-<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
 <title>PUIG VALUE™ WEB</title>
 <style>
 :root{--bg:#0b0f14;--panel:#151a22;--soft:#202733;--line:#2b3442;--text:#f7f8fb;--muted:#aab4c5;--accent:#e41270;--green:#54c999;--orange:#efb45e;--red:#ed7b7b;--blue:#73a8ff}
@@ -25,6 +25,105 @@ button{border:0;border-radius:11px;padding:11px 14px;font-weight:800;cursor:poin
 .suggestion:hover,.suggestion.active{background:#202733}
 .suggestion small{display:block;color:var(--muted);margin-top:2px}
 .empty-state{padding:20px;border:1px dashed var(--line);border-radius:12px;color:var(--muted);font-size:12px;text-align:center}
+
+/* ===== Responsive V1.4 ===== */
+html,body{max-width:100%;overflow-x:hidden}
+img,canvas{max-width:100%}
+button,input,select{font-size:16px} /* évite le zoom automatique iOS */
+.top{flex-wrap:wrap}
+.card{min-width:0}
+.layout>*{min-width:0}
+.scroll{-webkit-overflow-scrolling:touch}
+.scroll table{min-width:900px}
+
+@media (max-width:1100px){
+  .wrap{max-width:100%;padding:0 14px}
+  .layout{grid-template-columns:1fr}
+  aside.card{order:2}
+  section.card{order:1}
+  .top{align-items:center}
+}
+
+@media (max-width:800px){
+  header{position:static}
+  .wrap{padding:0 10px}
+  main{padding:10px 0}
+  .card{padding:13px;border-radius:14px}
+  .grid{grid-template-columns:1fr 1fr}
+  .full{grid-column:1/-1}
+  .kpis{grid-template-columns:1fr 1fr}
+  .big{grid-column:1/-1}
+  .big .val{font-size:30px}
+  .val{font-size:20px}
+  .row.no-print{width:100%}
+  .row.no-print button{flex:1 1 auto}
+  #map{height:320px!important}
+  .section{margin-top:15px}
+}
+
+@media (max-width:600px){
+  .top{display:block;padding:12px 0}
+  .brand{margin-bottom:10px}
+  h1{font-size:19px}
+  .sub{font-size:10px}
+  .top>.row{display:grid;grid-template-columns:1fr 1fr;width:100%}
+  .top>.row button{width:100%}
+
+  .layout{gap:10px}
+  .card{padding:12px}
+  .card h2{font-size:16px}
+  .grid{grid-template-columns:1fr}
+  .full{grid-column:1}
+  .kpis{grid-template-columns:1fr 1fr;gap:8px}
+  .kpi{padding:10px}
+  .big{grid-column:1/-1}
+  .big .val{font-size:28px}
+  .val{font-size:18px}
+  label{font-size:12px}
+  input,select{padding:12px 11px;min-height:44px}
+  button{min-height:44px;padding:11px 12px}
+  .row{gap:7px}
+  .row.no-print{display:grid;grid-template-columns:1fr}
+  .row.no-print button{width:100%}
+  #loader{display:none!important}
+  #loader[style*="flex"]{display:flex!important}
+
+  .scroll{max-height:360px;border-radius:10px}
+  .scroll table{min-width:820px;font-size:10px}
+  th,td{padding:7px 6px}
+
+  #map{height:280px!important}
+  .status{padding:10px;font-size:11px}
+  .comp{padding:9px}
+  .metric{grid-template-columns:105px 1fr 40px}
+
+  /* Charts stack vertically */
+  .section + div[style*="grid-template-columns:1fr 1fr"]{
+    grid-template-columns:1fr!important;
+  }
+
+  /* Autocomplete easier to use on mobile */
+  .suggestions{max-height:220px}
+  .suggestion{padding:12px 10px;font-size:13px}
+}
+
+@media (max-width:420px){
+  .wrap{padding:0 8px}
+  .kpis{grid-template-columns:1fr}
+  .big{grid-column:1}
+  .val{font-size:21px}
+  .big .val{font-size:27px}
+  .badge{font-size:10px}
+  #map{height:250px!important}
+  .scroll{max-height:320px}
+}
+
+/* Touch targets */
+@media (hover:none) and (pointer:coarse){
+  button,.btn,input,select,.suggestion{min-height:44px}
+  .suggestion{display:flex;flex-direction:column;justify-content:center}
+}
+
 </style>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -33,7 +132,7 @@ button{border:0;border-radius:11px;padding:11px 14px;font-weight:800;cursor:poin
 <body>
 <header><div class="wrap top">
 <div class="brand"><div class="logo">PV</div><div><h1>PUIG VALUE™ WEB</h1><div class="sub">DVF réel · Géocodage IGN · historique des estimations</div></div></div>
-<div class="row no-print"><button class="ghost" onclick="loadHistory()">Historique</button><button class="ghost" onclick="window.print()">PDF</button></div>
+<div class="row no-print header-actions"><button class="ghost" onclick="loadHistory()">Historique</button><button class="ghost" onclick="window.print()">PDF</button></div>
 </div></header>
 <main class="wrap"><div class="layout">
 <section class="card">
