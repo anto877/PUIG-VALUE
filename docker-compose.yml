@@ -1,0 +1,10 @@
+services:
+  puig-value:
+    build: .
+    ports:
+      - "8000:8000"
+    volumes:
+      - puig_value_data:/app/data
+    restart: unless-stopped
+volumes:
+  puig_value_data:

@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: puig-value
+    runtime: docker
+    plan: starter
+    healthCheckPath: /api/health
+    envVars:
+      - key: PUIG_DATA_DIR
+        value: /var/data
+    disk:
+      name: puig-value-data
+      mountPath: /var/data
+      sizeGB: 1
