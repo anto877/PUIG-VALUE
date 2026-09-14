@@ -73,7 +73,7 @@ button{border:0;border-radius:11px;padding:11px 14px;font-weight:800;cursor:poin
 </main>
 <script>
 const $=id=>document.getElementById(id);
-function money(x){return Number.isFinite(+x)?Math.round(+x/1000)*1000 .toLocaleString("fr-FR")+" €":"—"}
+function money(x){return Number.isFinite(+x)?(Math.round(+x/1000)*1000).toLocaleString("fr-FR")+" €":"—"}
 function ppm(x){return Number.isFinite(+x)?Math.round(+x).toLocaleString("fr-FR")+" €/m²":"—"}
 function payload(){
  let ex=+$("expert_value").value;
