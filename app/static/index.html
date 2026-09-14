@@ -18,6 +18,9 @@ button{border:0;border-radius:11px;padding:11px 14px;font-weight:800;cursor:poin
 @media(max-width:1020px){.layout{grid-template-columns:1fr}}@media(max-width:680px){.grid,.kpis{grid-template-columns:1fr}.top{align-items:flex-start}}
 @media print{header,.no-print{display:none!important}body{background:white;color:#111}.card,.kpi,.status{background:white;color:#111;border-color:#bbb}.layout{display:block}.card{margin-bottom:15px}.mini,.lab,label{color:#555}.scroll{max-height:none;overflow:visible}th{position:static;background:white;color:#111}}
 </style>
+<link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+<script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
 </head>
 <body>
 <header><div class="wrap top">
@@ -39,6 +42,10 @@ button{border:0;border-radius:11px;padding:11px 14px;font-weight:800;cursor:poin
 <div><label>Tolérance surface</label><select id="surface_tolerance"><option value=".15">±15 %</option><option value=".25" selected>±25 %</option><option value=".35">±35 %</option><option value=".50">±50 %</option></select></div>
 <div><label>Pression marché (0–100)</label><input id="pressure" type="number" value="60" min="0" max="100"></div>
 <div><label>Avis expert (€) — optionnel</label><input id="expert_value" type="number" placeholder="Ex. 310000"></div>
+<div><label>Garage / stationnement</label><select id="garage"><option value="false">Non</option><option value="true">Oui</option></select></div>
+<div><label>Micro-localisation (1–10)</label><input id="micro_location" type="number" value="7" min="1" max="10"></div>
+<div><label>Architecture / cachet (1–10)</label><input id="architecture" type="number" value="7" min="1" max="10"></div>
+<div><label>Nuisances</label><select id="nuisance"><option value="0">Aucune</option><option value="1">Faibles</option><option value="2">Moyennes</option><option value="3">Fortes</option></select></div>
 </div>
 <div class="row no-print" style="margin-top:14px">
 <button class="primary" onclick="estimate()">Analyser le bien</button>
@@ -48,6 +55,17 @@ button{border:0;border-radius:11px;padding:11px 14px;font-weight:800;cursor:poin
 
 <div class="section">Comparables DVF retenus</div>
 <div class="scroll"><table><thead><tr><th>Adresse</th><th>Date</th><th>Prix</th><th>€/m²</th><th>Surface</th><th>Terrain</th><th>Pièces</th><th>Distance</th><th>Score</th><th>Valeur ajustée</th></tr></thead><tbody id="tbody"></tbody></table></div>
+
+<div class="section">Carte géolocalisée des références</div>
+<div id="map" style="height:420px;border-radius:14px;border:1px solid var(--line);overflow:hidden"></div>
+
+<div class="section">Régressions et sensibilité</div>
+<div style="display:grid;grid-template-columns:1fr 1fr;gap:12px">
+  <div class="status"><canvas id="surfaceChart" height="210"></canvas></div>
+  <div class="status"><canvas id="distanceChart" height="210"></canvas></div>
+  <div class="status"><canvas id="conditionChart" height="210"></canvas></div>
+  <div class="status"><canvas id="dpeChart" height="210"></canvas></div>
+</div>
 </section>
 
 <aside class="card">
@@ -64,6 +82,7 @@ button{border:0;border-radius:11px;padding:11px 14px;font-weight:800;cursor:poin
 <div class="row" style="justify-content:space-between"><span id="confLabel" class="badge">—</span><b id="confText">—</b></div>
 <div class="progress" style="margin-top:8px"><div id="confBar" style="width:0"></div></div><div id="breakdown"></div>
 <div class="section">Analyse du marché</div><div id="analysis" class="mini">—</div>
+<div class="section">Impact des critères du bien</div><div id="qualityImpact" class="mini">—</div>
 <div class="section">Top comparables</div><div id="top"></div>
 <div class="section">Contrôle contradictoire</div><div id="alerts" class="mini">—</div>
 <div class="section">Historique récent</div><div id="history" class="mini">Clique sur « Historique » pour afficher les dernières estimations.</div>
@@ -72,7 +91,7 @@ button{border:0;border-radius:11px;padding:11px 14px;font-weight:800;cursor:poin
 <div class="footer">PUIG VALUE™ WEB — DVF open-data / géocodage IGN. L'estimation reste une aide à l'expertise et doit être validée après visite.</div>
 </main>
 <script>
-const $=id=>document.getElementById(id);
+const $=id=>document.getElementById(id); let mapObj=null; let charts={};
 function money(x){return Number.isFinite(+x)?(Math.round(+x/1000)*1000).toLocaleString("fr-FR")+" €":"—"}
 function ppm(x){return Number.isFinite(+x)?Math.round(+x).toLocaleString("fr-FR")+" €/m²":"—"}
 function payload(){
@@ -81,7 +100,12 @@ function payload(){
   address:$("address").value.trim(), property_type:$("property_type").value, surface:+$("surface").value,
   land:+$("land").value||0, rooms:+$("rooms").value||0, condition:+$("condition").value||7, dpe:$("dpe").value,
   radius_m:+$("radius_m").value, surface_tolerance:+$("surface_tolerance").value, pressure:+$("pressure").value||50,
-  expert_value:ex>0?ex:null, years:[2021,2022,2023,2024,2025]
+  expert_value:ex>0?ex:null,
+  garage:$("garage").value==="true",
+  micro_location:+$("micro_location").value||7,
+  architecture:+$("architecture").value||7,
+  nuisance:+$("nuisance").value||0,
+  years:[2021,2022,2023,2024,2025]
  }
 }
 async function estimate(){
@@ -93,17 +117,77 @@ async function estimate(){
  }catch(e){$("status").innerHTML=`<span class="bad"><b>Erreur :</b> ${e.message}</span>`}
  finally{$("loader").style.display="none"}
 }
+
+function destroyChart(name){ if(charts[name]){ charts[name].destroy(); charts[name]=null; } }
+
+function renderMap(d){
+  if(typeof L==="undefined") return;
+  if(mapObj){ mapObj.remove(); mapObj=null; }
+  mapObj=L.map("map").setView([d.geocode.lat,d.geocode.lon],16);
+  L.tileLayer("https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png",{maxZoom:19,attribution:"© OpenStreetMap"}).addTo(mapObj);
+  L.marker([d.geocode.lat,d.geocode.lon]).addTo(mapObj).bindPopup("<b>Bien expertisé</b><br>"+d.geocode.label).openPopup();
+  d.comparables.forEach((x,i)=>{
+    L.circleMarker([x.lat,x.lon],{radius:7}).addTo(mapObj)
+      .bindPopup(`<b>${i+1}. ${x.address||x.parcel}</b><br>${money(x.price)} · ${ppm(x.price_per_m2)}<br>${x.surface} m² · ${Math.round(x.distance)} m<br>Score ${x.score}/100`);
+  });
+  if(d.comparables.length){
+    const pts=[[d.geocode.lat,d.geocode.lon],...d.comparables.map(x=>[x.lat,x.lon])];
+    mapObj.fitBounds(pts,{padding:[30,30]});
+  }
+}
+
+function renderCharts(d){
+  if(typeof Chart==="undefined") return;
+  const comps=d.comparables;
+  destroyChart("surface");
+  charts.surface=new Chart($("surfaceChart"),{
+    type:"scatter",
+    data:{datasets:[
+      {label:"Ventes DVF",data:comps.map(x=>({x:x.surface,y:x.price_per_m2}))},
+      ...(d.regression.surface_vs_ppm?[{type:"line",label:"Régression",data:[40,80,120,160,200,250,300].map(x=>({x,y:d.regression.surface_vs_ppm.intercept+d.regression.surface_vs_ppm.slope*x})),pointRadius:0}]:[])
+    ]},
+    options:{plugins:{title:{display:true,text:"Surface vs prix/m²"}},scales:{x:{title:{display:true,text:"Surface (m²)"}},y:{title:{display:true,text:"€/m²"}}}}
+  });
+
+  destroyChart("distance");
+  charts.distance=new Chart($("distanceChart"),{
+    type:"scatter",
+    data:{datasets:[
+      {label:"Ventes DVF",data:comps.map(x=>({x:x.distance,y:x.price_per_m2}))},
+      ...(d.regression.distance_vs_ppm?[{type:"line",label:"Régression",data:[0,100,200,300,500,750,1000].map(x=>({x,y:d.regression.distance_vs_ppm.intercept+d.regression.distance_vs_ppm.slope*x})),pointRadius:0}]:[])
+    ]},
+    options:{plugins:{title:{display:true,text:"Distance vs prix/m²"}},scales:{x:{title:{display:true,text:"Distance (m)"}},y:{title:{display:true,text:"€/m²"}}}}
+  });
+
+  const sens=d.regression.sensitivity||[];
+  const cond=sens.filter(x=>x.criterion==="condition");
+  destroyChart("condition");
+  charts.condition=new Chart($("conditionChart"),{
+    type:"line",data:{labels:cond.map(x=>x.x),datasets:[{label:"Valeur estimée",data:cond.map(x=>x.value)}]},
+    options:{plugins:{title:{display:true,text:"Sensibilité à l’état du bien"}},scales:{x:{title:{display:true,text:"État (1–10)"}},y:{title:{display:true,text:"Valeur (€)"}}}}
+  });
+
+  const dp=sens.filter(x=>x.criterion==="dpe");
+  destroyChart("dpe");
+  charts.dpe=new Chart($("dpeChart"),{
+    type:"line",data:{labels:dp.map(x=>x.x),datasets:[{label:"Valeur estimée",data:dp.map(x=>x.value)}]},
+    options:{plugins:{title:{display:true,text:"Sensibilité au DPE"}},scales:{x:{title:{display:true,text:"Classe DPE"}},y:{title:{display:true,text:"Valeur (€)"}}}}
+  });
+}
+
 function render(d){
  let v=d.valuation,c=d.confidence,m=d.market;
  $("central").textContent=money(v.central);$("low").textContent=money(v.low);$("high").textContent=money(v.high);
  $("listing").textContent=money(v.listing);$("quick").textContent=money(v.quick_sale);$("ambitious").textContent=money(v.ambitious);
  $("confText").textContent=Math.round(c.score)+"/100";$("confBar").style.width=c.score+"%";$("confLabel").textContent=c.score>=85?"Confiance élevée":c.score>=70?"Confiance correcte":"Confiance prudente";
  $("breakdown").innerHTML=Object.entries(c.parts).map(([n,x])=>{let max={"Qualité comparables":30,"Nombre de comparables":15,"Fraîcheur":10,"Dispersion":15,"Données du bien":10,"Micro-localisation":5,"Marché actif":5,"Validation expert":5,"Absence d'anomalies":5}[n]||10;return `<div class="metric"><span>${n}</span><div class="bar"><div style="width:${Math.min(100,x/max*100)}%"></div></div><span>${Math.round(x)}/${max}</span></div>`}).join("");
- $("analysis").innerHTML=`Adresse reconnue : <b>${d.geocode.label}</b><br>Commune : <b>${d.geocode.city}</b> (${d.source.citycode})<br>Transactions résidentielles simples analysées : <b>${d.source.sales_scanned}</b><br>Rayon effectif : <b>${d.search.effective_radius_m} m</b><br>Prix/m² médian : <b>${ppm(m.median_price_per_m2)}</b><br>Distance médiane : <b>${m.median_distance_m} m</b>.`;
+ $("analysis").innerHTML=`Adresse reconnue : <b>${d.geocode.label}</b><br>Commune : <b>${d.geocode.city}</b> (${d.source.citycode})<br>Transactions résidentielles simples analysées : <b>${d.source.sales_scanned}</b><br>Méthode : <b>${d.search.selection_method}</b><br>Rayon effectif : <b>${d.search.effective_radius_m} m</b><br>Prix/m² médian : <b>${ppm(m.median_price_per_m2)}</b><br>Distance médiane : <b>${m.median_distance_m} m</b>.`;
+ const q=v.quality_adjustment||{};
+ $("qualityImpact").innerHTML=`Base comparables : <b>${money(v.comparables_value)}</b><br>Après critères du bien : <b>${money(v.quality_adjusted_value)}</b><br>État : <b>${q.condition||0}%</b> · DPE : <b>${q.dpe||0}%</b> · Garage : <b>${q.garage||0}%</b> · Micro-localisation : <b>${q.micro_location||0}%</b> · Architecture : <b>${q.architecture||0}%</b> · Nuisances : <b>${q.nuisance||0}%</b><br>Ajustement total : <b>${q.total||0}%</b>.`;
  $("tbody").innerHTML=d.comparables.map(x=>`<tr><td>${x.address||x.parcel}</td><td>${x.date}</td><td>${money(x.price)}</td><td>${ppm(x.price_per_m2)}</td><td>${x.surface}</td><td>${x.land||"—"}</td><td>${x.rooms||"—"}</td><td>${Math.round(x.distance)} m</td><td><b>${x.score}</b></td><td>${money(x.adjusted_value)}</td></tr>`).join("");
  $("top").innerHTML=d.comparables.slice(0,5).map(x=>`<div class="comp"><b>${x.address||x.parcel}</b><div class="mini">${x.date} · ${money(x.price)} · ${ppm(x.price_per_m2)} · ${x.surface} m² · ${Math.round(x.distance)} m · score ${x.score}</div></div>`).join("");
  $("alerts").innerHTML=d.alerts.length?d.alerts.map(x=>"• "+x).join("<br>"):"Aucune alerte automatique majeure.";
- loadHistory()
+ renderMap(d); renderCharts(d); loadHistory()
 }
 async function loadHistory(){
  try{

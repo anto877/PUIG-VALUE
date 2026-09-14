@@ -42,6 +42,10 @@ class EstimateRequest(BaseModel):
     surface_tolerance: float = Field(default=0.25, ge=0.05, le=0.75)
     pressure: int = Field(default=50, ge=0, le=100)
     expert_value: float | None = Field(default=None, gt=0)
+    garage: bool = False
+    micro_location: int = Field(default=7, ge=1, le=10)
+    architecture: int = Field(default=7, ge=1, le=10)
+    nuisance: int = Field(default=0, ge=0, le=3)
     years: list[int] = Field(default_factory=lambda: [2021, 2022, 2023, 2024, 2025])
 
 
@@ -252,6 +256,64 @@ def land_score(a, b):
     return max(0, min(100, 100 - abs(math.log(a/b))*35))
 
 
+def norm_address(s: str) -> str:
+    import unicodedata, re
+    s = unicodedata.normalize("NFD", (s or "").lower())
+    s = "".join(c for c in s if unicodedata.category(c) != "Mn")
+    s = re.sub(r"[^a-z0-9 ]+", " ", s)
+    s = re.sub(r"\\s+", " ", s).strip()
+    return s
+
+
+def street_only(s: str) -> str:
+    import re
+    s = norm_address(s)
+    return re.sub(r"^\\d+[a-z]?\\s+", "", s).strip()
+
+
+DPE_ADJ = {"A": 0.05, "B": 0.03, "C": 0.015, "D": 0.0, "E": -0.02, "F": -0.05, "G": -0.08}
+
+
+def subject_quality_adjustment(req: EstimateRequest) -> dict[str, float]:
+    # Coefficients V1.2 explicités et volontairement plafonnés.
+    # Ils sont à recalibrer ultérieurement par apprentissage sur ventes réelles.
+    condition = max(-0.125, min(0.075, (req.condition - 7) * 0.025))
+    dpe = DPE_ADJ.get(req.dpe, 0.0)
+    garage = 0.025 if req.garage else 0.0
+    micro = max(-0.06, min(0.06, (req.micro_location - 7) * 0.02))
+    architecture = max(-0.045, min(0.045, (req.architecture - 7) * 0.015))
+    nuisance = -0.025 * req.nuisance
+    total = condition + dpe + garage + micro + architecture + nuisance
+    total = max(-0.22, min(0.18, total))
+    return {
+        "condition": condition,
+        "dpe": dpe,
+        "garage": garage,
+        "micro_location": micro,
+        "architecture": architecture,
+        "nuisance": nuisance,
+        "total": total,
+    }
+
+
+def simple_linear_regression(points: list[tuple[float, float]]) -> dict[str, float] | None:
+    pts = [(float(x), float(y)) for x, y in points if x is not None and y is not None and math.isfinite(float(x)) and math.isfinite(float(y))]
+    if len(pts) < 3:
+        return None
+    xs = [p[0] for p in pts]
+    ys = [p[1] for p in pts]
+    xm = sum(xs)/len(xs); ym = sum(ys)/len(ys)
+    sxx = sum((x-xm)**2 for x in xs)
+    if sxx == 0:
+        return None
+    slope = sum((x-xm)*(y-ym) for x,y in pts)/sxx
+    intercept = ym - slope*xm
+    sst = sum((y-ym)**2 for y in ys)
+    sse = sum((y-(intercept+slope*x))**2 for x,y in pts)
+    r2 = 1 - sse/sst if sst else 0
+    return {"slope": slope, "intercept": intercept, "r2": max(0, min(1, r2))}
+
+
 def comp_score(req: EstimateRequest, sale, distance):
     room_score = 70
     if req.rooms and sale["rooms"]:
@@ -326,51 +388,82 @@ async def estimate(req: EstimateRequest):
 
     sales = load_simple_sales(files)
     candidates = []
+    subject_addr = norm_address(geo["label"])
+    subject_street = street_only(geo["label"])
+
     for s in sales:
         if s["type"] != req.property_type:
             continue
-        if abs(s["surface"] - req.surface) / req.surface > req.surface_tolerance:
+        surf_gap = abs(s["surface"] - req.surface) / req.surface
+        if surf_gap > req.surface_tolerance:
             continue
         d = haversine(geo["lat"], geo["lon"], s["lat"], s["lon"])
-        if d > req.radius_m:
-            continue
+        sale_addr = norm_address(s["address"])
+        same_building = bool(subject_addr and sale_addr and (
+            sale_addr in subject_addr or subject_addr in sale_addr
+        ))
+        same_street = bool(subject_street and street_only(s["address"]) == subject_street)
         sc = comp_score(req, s, d)
+        if same_building:
+            sc = min(100, sc + 12)
+        elif same_street:
+            sc = min(100, sc + 6)
         candidates.append({
             **s,
             "distance": round(d, 1),
             "months": age_months(s["date"]),
             "score": round(sc, 1),
             "price_per_m2": round(s["price"]/s["surface"], 0),
+            "same_building": same_building,
+            "same_street": same_street,
         })
 
-    candidates.sort(key=lambda x: x["score"], reverse=True)
-    selected = [c for c in candidates if c["score"] >= 60][:25]
+    # Hiérarchie stricte des comparables.
+    if req.property_type == "Appartement":
+        tier1 = [c for c in candidates if c["same_building"]]
+        tier2 = [c for c in candidates if c["same_street"] and c["distance"] <= 250]
+        tier3 = [c for c in candidates if c["distance"] <= 350]
+        tier4 = [c for c in candidates if c["distance"] <= 600]
+        tiers = [tier1, tier2, tier3, tier4]
+        target_n = 10
+    else:
+        tier1 = [c for c in candidates if c["distance"] <= 300]
+        tier2 = [c for c in candidates if c["distance"] <= 500]
+        tier3 = [c for c in candidates if c["distance"] <= 750]
+        tier4 = [c for c in candidates if c["distance"] <= min(req.radius_m, 1000)]
+        tiers = [tier1, tier2, tier3, tier4]
+        target_n = 12
 
-    # élargissement automatique au sein de la même commune si trop peu de comparables
-    expanded_radius = req.radius_m
-    if len(selected) < 5 and req.radius_m < 3000:
-        expanded_radius = min(3000, max(1500, req.radius_m*2))
-        more = []
-        for s in sales:
-            if s["type"] != req.property_type:
+    selected = []
+    seen = set()
+    effective_radius = 0
+    for tier in tiers:
+        tier = sorted(tier, key=lambda x: x["score"], reverse=True)
+        for c in tier:
+            if c["score"] < 60 or c["id_mutation"] in seen:
                 continue
-            if abs(s["surface"] - req.surface) / req.surface > min(.50, req.surface_tolerance + .15):
+            seen.add(c["id_mutation"])
+            selected.append(c)
+            effective_radius = max(effective_radius, c["distance"])
+            if len(selected) >= target_n:
+                break
+        if len(selected) >= 5:
+            break
+
+    # En dernier recours seulement : rayon élargi mais plafonné à 1 km.
+    if len(selected) < 5:
+        fallback = sorted([c for c in candidates if c["distance"] <= min(req.radius_m, 1000) and c["score"] >= 60],
+                          key=lambda x: x["score"], reverse=True)
+        for c in fallback:
+            if c["id_mutation"] in seen:
                 continue
-            d = haversine(geo["lat"], geo["lon"], s["lat"], s["lon"])
-            if d > expanded_radius:
-                continue
-            sc = comp_score(req, s, d)
-            if sc >= 60:
-                more.append({**s, "distance": round(d,1), "months": age_months(s["date"]),
-                             "score": round(sc,1), "price_per_m2": round(s["price"]/s["surface"],0)})
-        more.sort(key=lambda x: x["score"], reverse=True)
-        seen = set()
-        selected = []
-        for c in more:
-            key = c["id_mutation"]
-            if key in seen: continue
-            seen.add(key); selected.append(c)
-            if len(selected) >= 25: break
+            seen.add(c["id_mutation"]); selected.append(c)
+            effective_radius = max(effective_radius, c["distance"])
+            if len(selected) >= target_n:
+                break
+
+    selected = selected[:target_n]
+    expanded_radius = round(effective_radius or req.radius_m)
 
     if not selected:
         raise HTTPException(422, "Aucun comparable DVF suffisamment pertinent dans les critères disponibles.")
@@ -390,7 +483,9 @@ async def estimate(req: EstimateRequest):
         den += weight
 
     vcomp = num/den
-    central = vcomp if not req.expert_value else vcomp*.90 + req.expert_value*.10
+    quality_adj = subject_quality_adjustment(req)
+    model_value = vcomp * (1 + quality_adj["total"])
+    central = model_value if not req.expert_value else model_value*.90 + req.expert_value*.10
 
     conf, parts, cv = confidence(selected, req.expert_value is not None)
     spread = .03 if conf >= 90 else .05 if conf >= 80 else .07 if conf >= 70 else .10 if conf >= 60 else .15
@@ -402,6 +497,20 @@ async def estimate(req: EstimateRequest):
     med_ppm = percentile([c["price_per_m2"] for c in selected], .5)
     med_dist = percentile([c["distance"] for c in selected], .5)
     med_age = percentile([c["months"] for c in selected], .5)
+
+    regression_surface = simple_linear_regression([(c["surface"], c["price_per_m2"]) for c in selected])
+    regression_distance = simple_linear_regression([(c["distance"], c["price_per_m2"]) for c in selected])
+    regression_age = simple_linear_regression([(c["months"], c["price_per_m2"]) for c in selected])
+
+    sensitivity = []
+    for cond in range(4, 11):
+        fake_req = req.model_copy(update={"condition": cond})
+        adj = subject_quality_adjustment(fake_req)
+        sensitivity.append({"criterion": "condition", "x": cond, "value": round(vcomp*(1+adj["total"]))})
+    for dpe_label in ["A","B","C","D","E","F","G"]:
+        fake_req = req.model_copy(update={"dpe": dpe_label})
+        adj = subject_quality_adjustment(fake_req)
+        sensitivity.append({"criterion": "dpe", "x": dpe_label, "value": round(vcomp*(1+adj["total"]))})
 
     alerts = []
     if len(selected) < 5: alerts.append("Moins de 5 comparables significatifs.")
@@ -422,12 +531,15 @@ async def estimate(req: EstimateRequest):
         "search": {
             "requested_radius_m": req.radius_m,
             "effective_radius_m": expanded_radius,
+            "selection_method": "Même immeuble/rue prioritaire pour appartements ; 300 m prioritaire pour maisons ; élargissement progressif et plafonné.",
             "surface_tolerance": req.surface_tolerance,
             "comparables_found": len(candidates),
             "comparables_selected": len(selected),
         },
         "valuation": {
             "comparables_value": round(vcomp),
+            "quality_adjusted_value": round(model_value),
+            "quality_adjustment": {k: round(v*100, 2) for k,v in quality_adj.items()},
             "central": round(central),
             "low": round(low),
             "high": round(high),
@@ -444,6 +556,12 @@ async def estimate(req: EstimateRequest):
             "median_price_per_m2": round(med_ppm or 0),
             "median_distance_m": round(med_dist or 0),
             "median_age_months": round(med_age or 0),
+        },
+        "regression": {
+            "surface_vs_ppm": regression_surface,
+            "distance_vs_ppm": regression_distance,
+            "age_vs_ppm": regression_age,
+            "sensitivity": sensitivity,
         },
         "alerts": alerts,
         "comparables": selected,
