@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
+<title>PUIG VALUE™ WEB</title>
+<style>
+:root{--bg:#0b0f14;--panel:#151a22;--soft:#202733;--line:#2b3442;--text:#f7f8fb;--muted:#aab4c5;--accent:#e41270;--green:#54c999;--orange:#efb45e;--red:#ed7b7b;--blue:#73a8ff}
+*{box-sizing:border-box}body{margin:0;font-family:Inter,Segoe UI,Arial,sans-serif;background:linear-gradient(180deg,#0b0f14,#121923);color:var(--text)}
+header{position:sticky;top:0;z-index:20;background:rgba(11,15,20,.96);border-bottom:1px solid var(--line)}.wrap{max-width:1480px;margin:auto;padding:0 20px}.top{display:flex;justify-content:space-between;align-items:center;padding:16px 0;gap:12px}
+.brand{display:flex;gap:12px;align-items:center}.logo{width:48px;height:48px;border-radius:15px;background:var(--accent);display:grid;place-items:center;font-weight:900}.sub{font-size:11px;color:var(--muted);margin-top:3px}h1{font-size:22px;margin:0}
+main{padding:20px 0}.layout{display:grid;grid-template-columns:1.07fr .93fr;gap:18px}.card{background:var(--panel);border:1px solid var(--line);border-radius:18px;padding:17px;box-shadow:0 10px 35px rgba(0,0,0,.14)}.card h2{margin:0 0 13px;font-size:17px}
+.grid{display:grid;grid-template-columns:repeat(3,minmax(0,1fr));gap:10px}.full{grid-column:1/-1}label{font-size:11px;color:var(--muted);display:block;margin-bottom:5px}input,select{width:100%;padding:11px;border-radius:10px;border:1px solid var(--line);background:#0f141b;color:var(--text);outline:none}input:focus,select:focus{border-color:var(--accent)}
+button{border:0;border-radius:11px;padding:11px 14px;font-weight:800;cursor:pointer}.primary{background:var(--accent);color:white}.ghost{background:var(--soft);color:white;border:1px solid var(--line)}.row{display:flex;gap:9px;align-items:center;flex-wrap:wrap}.section{font-size:12px;text-transform:uppercase;letter-spacing:.08em;color:#d4dbe7;margin:18px 0 9px}.status{background:#0f141b;border:1px solid var(--line);border-radius:12px;padding:11px;font-size:12px;line-height:1.5}.ok{color:var(--green)}.bad{color:var(--red)}.warn{color:var(--orange)}.mini{font-size:11px;color:var(--muted);line-height:1.5}
+.kpis{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px}.kpi{background:#0f141b;border:1px solid var(--line);border-radius:14px;padding:13px}.big{grid-column:1/-1}.lab{font-size:11px;color:var(--muted)}.val{font-size:22px;font-weight:900;margin-top:4px}.big .val{font-size:35px}
+.progress{height:9px;background:#0b0f14;border:1px solid var(--line);border-radius:999px;overflow:hidden}.progress>div{height:100%;background:var(--accent);transition:.3s}.badge{display:inline-flex;padding:5px 9px;border-radius:999px;background:#232b38;font-size:11px;font-weight:800}
+.scroll{overflow:auto;max-height:430px;border:1px solid var(--line);border-radius:12px}table{width:100%;border-collapse:collapse;min-width:1100px;font-size:11px}th,td{padding:8px;border-bottom:1px solid var(--line);white-space:nowrap;text-align:right}th:first-child,td:first-child{text-align:left}th{background:var(--panel);position:sticky;top:0}.comp{background:#0f141b;border:1px solid var(--line);border-radius:11px;padding:10px;margin-bottom:7px}.metric{display:grid;grid-template-columns:130px 1fr 45px;gap:8px;align-items:center;font-size:11px;margin:7px 0}.bar{height:7px;background:#0b0f14;border-radius:999px;overflow:hidden}.bar>div{height:100%;background:var(--blue)}
+.loader{display:none;align-items:center;gap:8px}.spin{width:16px;height:16px;border:2px solid #555;border-top-color:var(--accent);border-radius:50%;animation:s .8s linear infinite}@keyframes s{to{transform:rotate(360deg)}}.footer{padding:24px 0;color:var(--muted);font-size:11px}
+@media(max-width:1020px){.layout{grid-template-columns:1fr}}@media(max-width:680px){.grid,.kpis{grid-template-columns:1fr}.top{align-items:flex-start}}
+@media print{header,.no-print{display:none!important}body{background:white;color:#111}.card,.kpi,.status{background:white;color:#111;border-color:#bbb}.layout{display:block}.card{margin-bottom:15px}.mini,.lab,label{color:#555}.scroll{max-height:none;overflow:visible}th{position:static;background:white;color:#111}}
+</style>
+</head>
+<body>
+<header><div class="wrap top">
+<div class="brand"><div class="logo">PV</div><div><h1>PUIG VALUE™ WEB</h1><div class="sub">DVF réel · Géocodage IGN · historique des estimations</div></div></div>
+<div class="row no-print"><button class="ghost" onclick="loadHistory()">Historique</button><button class="ghost" onclick="window.print()">PDF</button></div>
+</div></header>
+<main class="wrap"><div class="layout">
+<section class="card">
+<h2>Nouvelle estimation</h2>
+<div class="grid">
+<div class="full"><label>Adresse complète</label><input id="address" value="14 rue du Progrès 87000 Limoges"></div>
+<div><label>Type</label><select id="property_type"><option>Maison</option><option>Appartement</option></select></div>
+<div><label>Surface habitable</label><input id="surface" type="number" value="150"></div>
+<div><label>Terrain</label><input id="land" type="number" value="520"></div>
+<div><label>Pièces principales</label><input id="rooms" type="number" value="6"></div>
+<div><label>État (1–10)</label><input id="condition" type="number" value="7" min="1" max="10"></div>
+<div><label>DPE</label><select id="dpe"><option>A</option><option>B</option><option>C</option><option selected>D</option><option>E</option><option>F</option><option>G</option></select></div>
+<div><label>Rayon initial</label><select id="radius_m"><option value="500">500 m</option><option value="750">750 m</option><option value="1000" selected>1 km</option><option value="1500">1,5 km</option><option value="2000">2 km</option></select></div>
+<div><label>Tolérance surface</label><select id="surface_tolerance"><option value=".15">±15 %</option><option value=".25" selected>±25 %</option><option value=".35">±35 %</option><option value=".50">±50 %</option></select></div>
+<div><label>Pression marché (0–100)</label><input id="pressure" type="number" value="60" min="0" max="100"></div>
+<div><label>Avis expert (€) — optionnel</label><input id="expert_value" type="number" placeholder="Ex. 310000"></div>
+</div>
+<div class="row no-print" style="margin-top:14px">
+<button class="primary" onclick="estimate()">Analyser le bien</button>
+<div id="loader" class="loader"><div class="spin"></div><span class="mini">Géocodage et analyse DVF… le premier appel peut prendre quelques secondes.</span></div>
+</div>
+<div id="status" class="status" style="margin-top:12px"><span class="ok">Serveur prêt.</span> Saisis un bien puis lance l'analyse.</div>
+
+<div class="section">Comparables DVF retenus</div>
+<div class="scroll"><table><thead><tr><th>Adresse</th><th>Date</th><th>Prix</th><th>€/m²</th><th>Surface</th><th>Terrain</th><th>Pièces</th><th>Distance</th><th>Score</th><th>Valeur ajustée</th></tr></thead><tbody id="tbody"></tbody></table></div>
+</section>
+
+<aside class="card">
+<h2>Conclusion PUIG VALUE</h2>
+<div class="kpis">
+<div class="kpi big"><div class="lab">Valeur vénale centrale</div><div id="central" class="val">—</div></div>
+<div class="kpi"><div class="lab">Fourchette basse</div><div id="low" class="val">—</div></div>
+<div class="kpi"><div class="lab">Fourchette haute</div><div id="high" class="val">—</div></div>
+<div class="kpi"><div class="lab">Prix conseillé</div><div id="listing" class="val">—</div></div>
+<div class="kpi"><div class="lab">Vente rapide</div><div id="quick" class="val">—</div></div>
+<div class="kpi"><div class="lab">Positionnement ambitieux</div><div id="ambitious" class="val">—</div></div>
+</div>
+<div class="section">PUIG Confidence™</div>
+<div class="row" style="justify-content:space-between"><span id="confLabel" class="badge">—</span><b id="confText">—</b></div>
+<div class="progress" style="margin-top:8px"><div id="confBar" style="width:0"></div></div><div id="breakdown"></div>
+<div class="section">Analyse du marché</div><div id="analysis" class="mini">—</div>
+<div class="section">Top comparables</div><div id="top"></div>
+<div class="section">Contrôle contradictoire</div><div id="alerts" class="mini">—</div>
+<div class="section">Historique récent</div><div id="history" class="mini">Clique sur « Historique » pour afficher les dernières estimations.</div>
+</aside>
+</div>
+<div class="footer">PUIG VALUE™ WEB — DVF open-data / géocodage IGN. L'estimation reste une aide à l'expertise et doit être validée après visite.</div>
+</main>
+<script>
+const $=id=>document.getElementById(id);
+function money(x){return Number.isFinite(+x)?Math.round(+x/1000)*1000 .toLocaleString("fr-FR")+" €":"—"}
+function ppm(x){return Number.isFinite(+x)?Math.round(+x).toLocaleString("fr-FR")+" €/m²":"—"}
+function payload(){
+ let ex=+$("expert_value").value;
+ return {
+  address:$("address").value.trim(), property_type:$("property_type").value, surface:+$("surface").value,
+  land:+$("land").value||0, rooms:+$("rooms").value||0, condition:+$("condition").value||7, dpe:$("dpe").value,
+  radius_m:+$("radius_m").value, surface_tolerance:+$("surface_tolerance").value, pressure:+$("pressure").value||50,
+  expert_value:ex>0?ex:null, years:[2021,2022,2023,2024,2025]
+ }
+}
+async function estimate(){
+ $("loader").style.display="flex";$("status").innerHTML="Analyse en cours…";
+ try{
+  let r=await fetch("/api/estimate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload())});
+  let d=await r.json();if(!r.ok)throw new Error(d.detail||"Erreur serveur");
+  render(d);$("status").innerHTML=`<span class="ok"><b>Analyse terminée.</b></span> ${d.geocode.label}. ${d.search.comparables_selected} comparables retenus.`;
+ }catch(e){$("status").innerHTML=`<span class="bad"><b>Erreur :</b> ${e.message}</span>`}
+ finally{$("loader").style.display="none"}
+}
+function render(d){
+ let v=d.valuation,c=d.confidence,m=d.market;
+ $("central").textContent=money(v.central);$("low").textContent=money(v.low);$("high").textContent=money(v.high);
+ $("listing").textContent=money(v.listing);$("quick").textContent=money(v.quick_sale);$("ambitious").textContent=money(v.ambitious);
+ $("confText").textContent=Math.round(c.score)+"/100";$("confBar").style.width=c.score+"%";$("confLabel").textContent=c.score>=85?"Confiance élevée":c.score>=70?"Confiance correcte":"Confiance prudente";
+ $("breakdown").innerHTML=Object.entries(c.parts).map(([n,x])=>{let max={"Qualité comparables":30,"Nombre de comparables":15,"Fraîcheur":10,"Dispersion":15,"Données du bien":10,"Micro-localisation":5,"Marché actif":5,"Validation expert":5,"Absence d'anomalies":5}[n]||10;return `<div class="metric"><span>${n}</span><div class="bar"><div style="width:${Math.min(100,x/max*100)}%"></div></div><span>${Math.round(x)}/${max}</span></div>`}).join("");
+ $("analysis").innerHTML=`Adresse reconnue : <b>${d.geocode.label}</b><br>Commune : <b>${d.geocode.city}</b> (${d.source.citycode})<br>Transactions résidentielles simples analysées : <b>${d.source.sales_scanned}</b><br>Rayon effectif : <b>${d.search.effective_radius_m} m</b><br>Prix/m² médian : <b>${ppm(m.median_price_per_m2)}</b><br>Distance médiane : <b>${m.median_distance_m} m</b>.`;
+ $("tbody").innerHTML=d.comparables.map(x=>`<tr><td>${x.address||x.parcel}</td><td>${x.date}</td><td>${money(x.price)}</td><td>${ppm(x.price_per_m2)}</td><td>${x.surface}</td><td>${x.land||"—"}</td><td>${x.rooms||"—"}</td><td>${Math.round(x.distance)} m</td><td><b>${x.score}</b></td><td>${money(x.adjusted_value)}</td></tr>`).join("");
+ $("top").innerHTML=d.comparables.slice(0,5).map(x=>`<div class="comp"><b>${x.address||x.parcel}</b><div class="mini">${x.date} · ${money(x.price)} · ${ppm(x.price_per_m2)} · ${x.surface} m² · ${Math.round(x.distance)} m · score ${x.score}</div></div>`).join("");
+ $("alerts").innerHTML=d.alerts.length?d.alerts.map(x=>"• "+x).join("<br>"):"Aucune alerte automatique majeure.";
+ loadHistory()
+}
+async function loadHistory(){
+ try{
+  let r=await fetch("/api/valuations?limit=8"),a=await r.json();
+  $("history").innerHTML=a.length?a.map(x=>`<div class="comp"><b>${x.address}</b><div class="mini">${money(x.central)} · confiance ${Math.round(x.confidence)}/100 · ${new Date(x.created_at).toLocaleString("fr-FR")}</div></div>`).join(""):"Aucune estimation enregistrée.";
+ }catch(e){$("history").textContent="Historique indisponible."}
+}
+loadHistory();
+</script>
+</body></html>
