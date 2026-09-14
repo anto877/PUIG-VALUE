@@ -111,6 +111,34 @@ async def geocode(q: str = Query(min_length=3)):
     return await geocode_address(q)
 
 
+@app.get("/api/address-search")
+async def address_search(q: str = Query(min_length=3), limit: int = Query(default=6, ge=1, le=10)):
+    params = {"q": q, "limit": limit, "autocomplete": 1}
+    timeout = httpx.Timeout(15.0)
+    async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
+        r = await client.get(GEOCODE_URL, params=params)
+        r.raise_for_status()
+        data = r.json()
+    out = []
+    for f in (data.get("features") or []):
+        p = f.get("properties") or {}
+        coords = f.get("geometry", {}).get("coordinates", [])
+        if len(coords) != 2:
+            continue
+        out.append({
+            "label": p.get("label") or "",
+            "name": p.get("name") or p.get("street") or "",
+            "street": p.get("street") or p.get("name") or "",
+            "postcode": str(p.get("postcode") or ""),
+            "city": p.get("city") or "",
+            "citycode": str(p.get("citycode") or ""),
+            "lon": float(coords[0]),
+            "lat": float(coords[1]),
+            "score": p.get("score"),
+        })
+    return out
+
+
 def dept_from_insee(insee: str) -> str:
     if insee.startswith(("2A", "2B")):
         return insee[:2]
