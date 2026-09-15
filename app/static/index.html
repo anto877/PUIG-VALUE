@@ -155,7 +155,17 @@ tr.excluded{opacity:.38;text-decoration:line-through}
 <div><label>Pièces principales</label><input id="rooms" type="number" placeholder="Nombre"></div>
 <div><label>État (1–10)</label><input id="condition" type="number" placeholder="1 à 10" min="1" max="10"></div>
 <div><label>DPE</label><select id="dpe"><option value="">Choisir…</option><option>A</option><option>B</option><option>C</option><option>D</option><option>E</option><option>F</option><option>G</option></select></div>
-<div><label>Rayon initial</label><select id="radius_m"><option value="500">500 m</option><option value="750">750 m</option><option value="1000" selected>1 km</option><option value="1500">1,5 km</option><option value="2000">2 km</option></select></div>
+<div><label>Rayon maximal de recherche</label><select id="radius_m">
+<option value="100">100 m</option>
+<option value="200">200 m</option>
+<option value="300">300 m</option>
+<option value="400">400 m</option>
+<option value="500" selected>500 m</option>
+<option value="750">750 m</option>
+<option value="1000">1 km</option>
+<option value="1500">1,5 km</option>
+<option value="2000">2 km</option>
+</select><div class="mini" style="margin-top:4px">Recherche automatique : 100 → 200 → 300 → 400 → 500 m, puis élargissement seulement si nécessaire.</div></div>
 <div><label>Tolérance surface</label><select id="surface_tolerance"><option value=".15">±15 %</option><option value=".25" selected>±25 %</option><option value=".35">±35 %</option><option value=".50">±50 %</option></select></div>
 <div><label>Pression marché (0–100)</label><input id="pressure" type="number" placeholder="0 à 100" min="0" max="100"></div>
 <div><label>Avis expert (€) — optionnel</label><input id="expert_value" type="number" placeholder="Ex. 310000"></div>
@@ -168,7 +178,7 @@ tr.excluded{opacity:.38;text-decoration:line-through}
 <button class="primary" onclick="estimate()">Analyser le bien</button><button class="ghost" onclick="saveCurrentEstimate()">Sauvegarder</button><button class="ghost" onclick="createExpertReport()">Créer le rapport d’expertise</button>
 <div id="loader" class="loader"><div class="spin"></div><span class="mini">Géocodage et analyse DVF… le premier appel peut prendre quelques secondes.</span></div>
 </div>
-<div id="status" class="status" style="margin-top:12px">Saisissez un bien pour commencer. Aucune référence n’est chargée au démarrage.</div>
+<div id="status" class="status" style="margin-top:12px">Saisissez un bien pour commencer. Aucune référence n’est chargée au démarrage.<br><span class="mini">Maison : 100 → 200 → 300 → 400 → 500 m puis élargissement si nécessaire. Appartement : priorité absolue à la même adresse.</span></div>
 
 <div class="section">Comparables DVF retenus</div>
 <div id="selectionNote" class="selection-note"></div><div class="scroll"><table><thead><tr><th>Utiliser</th><th>Adresse</th><th>Date</th><th>Prix</th><th>€/m²</th><th>Surface</th><th>Terrain</th><th>Pièces</th><th>Distance</th><th>Score</th><th>Valeur ajustée</th></tr></thead><tbody id="tbody"><tr id="emptyRow"><td colspan="11"><div class="empty-state">Aucune référence sélectionnée. Lancez une analyse pour afficher les comparables DVF.</div></td></tr></tbody></table></div>
@@ -309,7 +319,9 @@ async function estimate(){
  $("loader").style.display="flex";$("status").innerHTML="Analyse en cours…";
  try{
   let r=await fetch("/api/estimate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload())});
-  let d=await r.json();if(!r.ok)throw new Error(d.detail||"Erreur serveur");
+  let raw=await r.text(),d;
+  try{d=JSON.parse(raw)}catch(_){throw new Error(r.ok?"Réponse serveur invalide":`Erreur serveur ${r.status}`)}
+  if(!r.ok)throw new Error(d.detail||`Erreur serveur ${r.status}`);
   currentPayload=payload(); currentResult=d; excludedComparableIds.clear();
   render(d);$("status").innerHTML=`<span class="ok"><b>Analyse terminée.</b></span> ${d.geocode.label}. ${d.search.comparables_selected} comparables retenus.`;
  }catch(e){$("status").innerHTML=`<span class="bad"><b>Erreur :</b> ${e.message}</span>`}

@@ -584,15 +584,18 @@ async def estimate(req: EstimateRequest):
             effective_radius = max((c["distance"] for c in selected), default=0)
             selection_method = "Appartement : références exclusivement à la même adresse"
         else:
-            tiers = [
-                ("même rue / 100 m", [c for c in candidates if c["same_street"] and c["distance"] <= 100]),
-                ("même rue / 200 m", [c for c in candidates if c["same_street"] and c["distance"] <= 200]),
-                ("300 m", [c for c in candidates if c["distance"] <= 300]),
-                ("400 m", [c for c in candidates if c["distance"] <= 400]),
-                ("500 m", [c for c in candidates if c["distance"] <= 500]),
-                ("750 m", [c for c in candidates if c["distance"] <= 750]),
-                ("1000 m", [c for c in candidates if c["distance"] <= min(req.radius_m, 1000)]),
-            ]
+            radius_steps = [100, 200, 300, 400, 500, 750, 1000, 1500, 2000]
+            allowed_steps = [r for r in radius_steps if r <= req.radius_m]
+            if not allowed_steps:
+                allowed_steps = [100]
+            tiers = []
+            if 100 in allowed_steps:
+                tiers.append(("même rue / 100 m", [c for c in candidates if c["same_street"] and c["distance"] <= 100]))
+            if 200 in allowed_steps:
+                tiers.append(("même rue / 200 m", [c for c in candidates if c["same_street"] and c["distance"] <= 200]))
+            for rr in [r for r in allowed_steps if r >= 300]:
+                label = f"{rr} m" if rr < 1000 else f"{rr/1000:g} km"
+                tiers.append((label, [c for c in candidates if c["distance"] <= rr]))
             selection_method = "Appartement : aucune vente à la même adresse, élargissement progressif"
             for label, tier in tiers:
                 for c in sorted(tier, key=lambda x: x["score"], reverse=True):
@@ -606,14 +609,14 @@ async def estimate(req: EstimateRequest):
                     selection_method += f" jusqu'à {label}"
                     break
     else:
+        radius_steps = [100, 200, 300, 400, 500, 750, 1000, 1500, 2000]
+        allowed_steps = [r for r in radius_steps if r <= req.radius_m]
+        if not allowed_steps:
+            allowed_steps = [100]
         tiers = [
-            ("100 m", [c for c in candidates if c["distance"] <= 100]),
-            ("200 m", [c for c in candidates if c["distance"] <= 200]),
-            ("300 m", [c for c in candidates if c["distance"] <= 300]),
-            ("400 m", [c for c in candidates if c["distance"] <= 400]),
-            ("500 m", [c for c in candidates if c["distance"] <= 500]),
-            ("750 m", [c for c in candidates if c["distance"] <= 750]),
-            ("1000 m", [c for c in candidates if c["distance"] <= min(req.radius_m, 1000)]),
+            (f"{r} m" if r < 1000 else f"{r/1000:g} km",
+             [c for c in candidates if c["distance"] <= r])
+            for r in allowed_steps
         ]
         selection_method = "Maison : élargissement progressif"
         for label, tier in tiers:
