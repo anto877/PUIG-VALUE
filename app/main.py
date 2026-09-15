@@ -13,6 +13,7 @@ import secrets
 import hashlib
 import hmac
 import time
+import base64
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
@@ -34,7 +35,7 @@ DVF_BASE = "https://files.data.gouv.fr/geo-dvf/latest/csv"
 DVF_CACHE_MAX_AGE_DAYS = int(os.getenv("DVF_CACHE_MAX_AGE_DAYS", "7"))
 DVF_SYNC_INTERVAL_HOURS = int(os.getenv("DVF_SYNC_INTERVAL_HOURS", "24"))
 
-app = FastAPI(title="PUIG VALUE WEB", version="2.4.0")
+app = FastAPI(title="PUIG VALUE WEB", version="2.5.0")
 
 # ============================================================
 # PUIG VALUE V2.4 - AUTHENTIFICATION PRIVEE
@@ -49,195 +50,177 @@ SESSION_MAX_AGE = 60 * 60 * 12  # 12 heures
 def auth_configured() -> bool:
     return bool(PUIG_ADMIN_USER and PUIG_ADMIN_PASSWORD and PUIG_SESSION_SECRET)
 
-def make_session_token(username: str, expires: int) -> str:
-    message = f"{username}|{expires}".encode("utf-8")
-    signature = hmac.new(
-        PUIG_SESSION_SECRET.encode("utf-8"),
-        message,
-        hashlib.sha256
-    ).hexdigest()
-    return f"{username}|{expires}|{signature}"
+def ensure_users_table(conn):
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS users(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT NOT NULL UNIQUE COLLATE NOCASE,
+            display_name TEXT NOT NULL DEFAULT '',
+            password_hash TEXT NOT NULL,
+            role TEXT NOT NULL DEFAULT 'expert',
+            active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL,
+            created_by TEXT NOT NULL DEFAULT ''
+        )
+    """)
+    conn.commit()
 
-def valid_session(token: str | None) -> bool:
-    if not auth_configured() or not token:
-        return False
+def hash_password(password: str, salt: bytes | None = None) -> str:
+    salt = salt or secrets.token_bytes(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, 310000)
+    return "pbkdf2_sha256$310000$" + base64.urlsafe_b64encode(salt).decode() + "$" + base64.urlsafe_b64encode(digest).decode()
+
+def verify_password(password: str, stored: str) -> bool:
     try:
-        username, expires_text, signature = token.rsplit("|", 2)
-        expires = int(expires_text)
-        if expires < int(time.time()):
-            return False
-        if not secrets.compare_digest(username, PUIG_ADMIN_USER):
-            return False
-        expected = hmac.new(
-            PUIG_SESSION_SECRET.encode("utf-8"),
-            f"{username}|{expires}".encode("utf-8"),
-            hashlib.sha256
-        ).hexdigest()
-        return hmac.compare_digest(signature, expected)
+        algo, rounds, salt64, digest64 = stored.split("$", 3)
+        if algo != "pbkdf2_sha256": return False
+        salt = base64.urlsafe_b64decode(salt64.encode())
+        expected = base64.urlsafe_b64decode(digest64.encode())
+        actual = hashlib.pbkdf2_hmac("sha256", password.encode(), salt, int(rounds))
+        return hmac.compare_digest(actual, expected)
     except Exception:
         return False
 
-PUBLIC_PATHS = {"/login", "/api/login", "/api/health"}
+def get_user_row(username: str):
+    try:
+        with get_db() as conn:
+            ensure_users_table(conn)
+            return conn.execute("SELECT * FROM users WHERE username=? COLLATE NOCASE",(username,)).fetchone()
+    except Exception:
+        return None
+
+def make_session_token(username: str, role: str, expires: int) -> str:
+    msg=f"{username}|{role}|{expires}".encode()
+    sig=hmac.new(PUIG_SESSION_SECRET.encode(),msg,hashlib.sha256).hexdigest()
+    return f"{username}|{role}|{expires}|{sig}"
+
+def session_identity(token: str | None):
+    if not auth_configured() or not token: return None
+    try:
+        username,role,expires_s,sig=token.rsplit("|",3)
+        expires=int(expires_s)
+        if expires<int(time.time()): return None
+        expected=hmac.new(PUIG_SESSION_SECRET.encode(),f"{username}|{role}|{expires}".encode(),hashlib.sha256).hexdigest()
+        if not hmac.compare_digest(sig,expected): return None
+        if secrets.compare_digest(username,PUIG_ADMIN_USER) and role=="superadmin":
+            return {"username":username,"display_name":username,"role":"superadmin"}
+        row=get_user_row(username)
+        if not row or not row["active"] or row["role"]!=role: return None
+        return {"username":row["username"],"display_name":row["display_name"] or row["username"],"role":row["role"]}
+    except Exception: return None
+
+def require_admin(request: Request):
+    ident=session_identity(request.cookies.get(SESSION_COOKIE))
+    if not ident or ident["role"] not in ("superadmin","admin"):
+        raise HTTPException(403,"Accès administrateur requis.")
+    return ident
+
+PUBLIC_PATHS={"/login","/api/login","/api/health"}
 
 @app.middleware("http")
-async def authentication_middleware(request: Request, call_next):
-    path = request.url.path
-    if path in PUBLIC_PATHS:
+async def authentication_middleware(request: Request,call_next):
+    if request.url.path in PUBLIC_PATHS: return await call_next(request)
+    ident=session_identity(request.cookies.get(SESSION_COOKIE))
+    if ident:
+        request.state.user=ident
         return await call_next(request)
+    if request.url.path.startswith("/api/"):
+        return JSONResponse(status_code=401,content={"detail":"Authentification requise"})
+    return RedirectResponse("/login",status_code=303)
 
-    if valid_session(request.cookies.get(SESSION_COOKIE)):
-        return await call_next(request)
-
-    if path.startswith("/api/"):
-        return JSONResponse(
-            status_code=401,
-            content={"detail": "Authentification requise"}
-        )
-    return RedirectResponse(url="/login", status_code=303)
-
-@app.get("/login", response_class=HTMLResponse)
+@app.get("/login",response_class=HTMLResponse)
 def login_page(request: Request):
-    if valid_session(request.cookies.get(SESSION_COOKIE)):
-        return RedirectResponse(url="/", status_code=303)
-
-    config_warning = "" if auth_configured() else """
-    <div class="warning">
-      La protection n'est pas encore configurée. Ajoutez les trois variables
-      PUIG_ADMIN_USER, PUIG_ADMIN_PASSWORD et PUIG_SESSION_SECRET dans Render.
-    </div>
-    """
-
-    return HTMLResponse(f"""<!doctype html>
-<html lang="fr">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width,initial-scale=1">
-<meta name="robots" content="noindex,nofollow">
-<title>Connexion · PUIG VALUE™</title>
-<style>
-*{{box-sizing:border-box}}
-body{{margin:0;background:#090e14;color:#f8fafc;font-family:Arial,sans-serif;
-min-height:100vh;display:grid;place-items:center;padding:20px}}
-.card{{width:min(430px,100%);background:#151b24;border:1px solid #2d3748;
-border-radius:18px;padding:30px;box-shadow:0 20px 70px rgba(0,0,0,.35)}}
-.brand{{display:flex;gap:14px;align-items:center;margin-bottom:26px}}
-.logo{{background:#ed0a72;border-radius:12px;width:50px;height:50px;
-display:grid;place-items:center;font-weight:900;font-size:18px}}
-h1{{font-size:23px;margin:0}}
-.sub{{color:#9ca3af;font-size:13px;margin-top:4px}}
-label{{display:block;color:#aeb7c4;font-size:12px;margin:16px 0 6px}}
-input{{width:100%;padding:13px;border-radius:10px;border:1px solid #344050;
-background:#0d131b;color:white;font-size:16px;outline:none}}
-input:focus{{border-color:#ed0a72}}
-button{{width:100%;margin-top:22px;padding:14px;border:0;border-radius:11px;
-background:#ed0a72;color:white;font-weight:800;font-size:16px;cursor:pointer}}
-.error{{color:#ff8d8d;font-size:13px;min-height:18px;margin-top:12px}}
-.warning{{background:#3a2418;border:1px solid #7c4a22;padding:11px;border-radius:9px;
-font-size:12px;line-height:1.45;margin-bottom:16px}}
-.secure{{text-align:center;color:#687386;font-size:11px;margin-top:18px}}
-</style>
-</head>
-<body>
-<div class="card">
-  <div class="brand">
-    <div class="logo">PV</div>
-    <div><h1>PUIG VALUE™</h1><div class="sub">Accès privé · PUIG EXPERTISES</div></div>
-  </div>
-  {config_warning}
-  <form id="loginForm">
-    <label>Identifiant</label>
-    <input id="username" autocomplete="username" required autofocus>
-    <label>Mot de passe</label>
-    <input id="password" type="password" autocomplete="current-password" required>
-    <button type="submit">Se connecter</button>
-    <div id="error" class="error"></div>
-  </form>
-  <div class="secure">Session privée sécurisée · expiration après 12 heures</div>
-</div>
-<script>
-document.getElementById("loginForm").addEventListener("submit", async (event) => {{
-  event.preventDefault();
-  const error = document.getElementById("error");
-  error.textContent = "";
-  try {{
-    const response = await fetch("/api/login", {{
-      method: "POST",
-      headers: {{"Content-Type":"application/json"}},
-      body: JSON.stringify({{
-        username: document.getElementById("username").value,
-        password: document.getElementById("password").value
-      }})
-    }});
-    if (response.ok) {{
-      window.location.replace("/");
-      return;
-    }}
-    const data = await response.json().catch(() => ({{}}));
-    error.textContent = data.detail || "Identifiant ou mot de passe incorrect.";
-  }} catch (_) {{
-    error.textContent = "Connexion au serveur impossible.";
-  }}
-}});
-</script>
-</body>
-</html>""")
+    if session_identity(request.cookies.get(SESSION_COOKIE)): return RedirectResponse("/",status_code=303)
+    warning="" if auth_configured() else '<div class="warning">La protection n’est pas encore configurée dans Render.</div>'
+    return HTMLResponse(f"""<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="robots" content="noindex,nofollow"><title>Connexion · PUIG VALUE™</title>
+<style>*{{box-sizing:border-box}}body{{margin:0;background:#090e14;color:#f8fafc;font-family:Arial;min-height:100vh;display:grid;place-items:center;padding:20px}}.card{{width:min(430px,100%);background:#151b24;border:1px solid #2d3748;border-radius:18px;padding:30px}}.brand{{display:flex;gap:14px;align-items:center;margin-bottom:26px}}.logo{{background:#ed0a72;border-radius:12px;width:50px;height:50px;display:grid;place-items:center;font-weight:900}}h1{{font-size:23px;margin:0}}.sub{{color:#9ca3af;font-size:13px}}label{{display:block;color:#aeb7c4;font-size:12px;margin:16px 0 6px}}input{{width:100%;padding:13px;border-radius:10px;border:1px solid #344050;background:#0d131b;color:white;font-size:16px}}button{{width:100%;margin-top:22px;padding:14px;border:0;border-radius:11px;background:#ed0a72;color:white;font-weight:800;font-size:16px}}.error{{color:#ff8d8d;font-size:13px;min-height:18px;margin-top:12px}}.warning{{background:#3a2418;padding:11px;border-radius:9px;font-size:12px;margin-bottom:16px}}.secure{{text-align:center;color:#687386;font-size:11px;margin-top:18px}}</style></head>
+<body><div class="card"><div class="brand"><div class="logo">PV</div><div><h1>PUIG VALUE™</h1><div class="sub">Accès privé · PUIG EXPERTISES</div></div></div>{{warning}}<form id="f"><label>Identifiant</label><input id="u" autocomplete="username" required autofocus><label>Mot de passe</label><input id="p" type="password" autocomplete="current-password" required><button>Se connecter</button><div id="e" class="error"></div></form><div class="secure">Compte personnel · session sécurisée 12 heures</div></div>
+<script>f.onsubmit=async(x)=>{{x.preventDefault();let r=await fetch("/api/login",{{method:"POST",headers:{{"Content-Type":"application/json"}},body:JSON.stringify({{username:u.value,password:p.value}})}});if(r.ok)location.replace("/");else{{let d=await r.json().catch(()=>({{}}));e.textContent=d.detail||"Identifiant ou mot de passe incorrect.";}}}}</script></body></html>""".replace("{warning}",warning))
 
 @app.post("/api/login")
 async def login(request: Request):
-    if not auth_configured():
-        raise HTTPException(
-            status_code=503,
-            detail="Authentification non configurée sur Render."
-        )
-
-    try:
-        data = await request.json()
-    except Exception:
-        raise HTTPException(status_code=400, detail="Requête invalide.")
-
-    username = str(data.get("username", ""))
-    password = str(data.get("password", ""))
-
-    user_ok = secrets.compare_digest(username, PUIG_ADMIN_USER)
-    password_ok = secrets.compare_digest(password, PUIG_ADMIN_PASSWORD)
-
-    if not (user_ok and password_ok):
-        raise HTTPException(
-            status_code=401,
-            detail="Identifiant ou mot de passe incorrect."
-        )
-
-    expires = int(time.time()) + SESSION_MAX_AGE
-    response = JSONResponse({"ok": True})
-    response.set_cookie(
-        key=SESSION_COOKIE,
-        value=make_session_token(PUIG_ADMIN_USER, expires),
-        max_age=SESSION_MAX_AGE,
-        httponly=True,
-        secure=True,
-        samesite="lax",
-        path="/"
-    )
+    if not auth_configured(): raise HTTPException(503,"Authentification non configurée sur Render.")
+    data=await request.json(); username=str(data.get("username","")).strip(); password=str(data.get("password",""))
+    role=None; canonical=username
+    if secrets.compare_digest(username,PUIG_ADMIN_USER) and secrets.compare_digest(password,PUIG_ADMIN_PASSWORD):
+        role="superadmin"; canonical=PUIG_ADMIN_USER
+    else:
+        row=get_user_row(username)
+        if row and row["active"] and verify_password(password,row["password_hash"]):
+            role=row["role"]; canonical=row["username"]
+    if not role: raise HTTPException(401,"Identifiant ou mot de passe incorrect.")
+    expires=int(time.time())+SESSION_MAX_AGE
+    response=JSONResponse({"ok":True,"username":canonical,"role":role})
+    response.set_cookie(SESSION_COOKIE,make_session_token(canonical,role,expires),max_age=SESSION_MAX_AGE,httponly=True,secure=True,samesite="lax",path="/")
     return response
 
 @app.post("/api/logout")
 def logout():
-    response = JSONResponse({"ok": True})
-    response.delete_cookie(
-        key=SESSION_COOKIE,
-        path="/",
-        secure=True,
-        httponly=True,
-        samesite="lax"
-    )
-    return response
+    response=JSONResponse({"ok":True}); response.delete_cookie(SESSION_COOKIE,path="/",secure=True,httponly=True,samesite="lax"); return response
 
 @app.get("/api/auth")
 def auth_status(request: Request):
-    return {
-        "authenticated": valid_session(request.cookies.get(SESSION_COOKIE)),
-        "username": PUIG_ADMIN_USER
-    }
+    ident=session_identity(request.cookies.get(SESSION_COOKIE))
+    return {"authenticated":bool(ident),**(ident or {})}
+
+@app.get("/api/users")
+def list_users(request: Request):
+    require_admin(request)
+    with get_db() as conn:
+        ensure_users_table(conn)
+        rows=conn.execute("SELECT id,username,display_name,role,active,created_at,created_by FROM users ORDER BY username COLLATE NOCASE").fetchall()
+    return [dict(x) for x in rows]
+
+@app.post("/api/users")
+async def create_user(request: Request):
+    admin=require_admin(request); d=await request.json()
+    username=str(d.get("username","")).strip(); name=str(d.get("display_name","")).strip(); password=str(d.get("password","")); role=str(d.get("role","expert"))
+    if len(username)<3 or len(password)<8: raise HTTPException(400,"Identifiant : 3 caractères minimum. Mot de passe : 8 caractères minimum.")
+    if role not in ("admin","expert","viewer"): raise HTTPException(400,"Rôle invalide.")
+    if username.lower()==PUIG_ADMIN_USER.lower(): raise HTTPException(400,"Identifiant réservé au Super Administrateur.")
+    try:
+        with get_db() as conn:
+            ensure_users_table(conn)
+            cur=conn.execute("INSERT INTO users(username,display_name,password_hash,role,active,created_at,created_by) VALUES(?,?,?,?,1,?,?)",(username,name,hash_password(password),role,datetime.utcnow().isoformat()+"Z",admin["username"]))
+            conn.commit()
+        return {"ok":True,"id":cur.lastrowid}
+    except sqlite3.IntegrityError: raise HTTPException(409,"Cet identifiant existe déjà.")
+
+@app.patch("/api/users/{user_id}")
+async def update_user(user_id:int,request:Request):
+    require_admin(request); d=await request.json()
+    with get_db() as conn:
+        ensure_users_table(conn); row=conn.execute("SELECT * FROM users WHERE id=?",(user_id,)).fetchone()
+        if not row: raise HTTPException(404,"Utilisateur introuvable.")
+        role=str(d.get("role",row["role"])); active=1 if bool(d.get("active",row["active"])) else 0; name=str(d.get("display_name",row["display_name"])).strip(); password=str(d.get("password",""))
+        if role not in ("admin","expert","viewer"): raise HTTPException(400,"Rôle invalide.")
+        if password and len(password)<8: raise HTTPException(400,"Mot de passe : 8 caractères minimum.")
+        if password: conn.execute("UPDATE users SET display_name=?,role=?,active=?,password_hash=? WHERE id=?",(name,role,active,hash_password(password),user_id))
+        else: conn.execute("UPDATE users SET display_name=?,role=?,active=? WHERE id=?",(name,role,active,user_id))
+        conn.commit()
+    return {"ok":True}
+
+@app.delete("/api/users/{user_id}")
+def delete_user(user_id:int,request:Request):
+    require_admin(request)
+    with get_db() as conn:
+        ensure_users_table(conn); cur=conn.execute("DELETE FROM users WHERE id=?",(user_id,)); conn.commit()
+    if not cur.rowcount: raise HTTPException(404,"Utilisateur introuvable.")
+    return {"ok":True}
+
+@app.get("/admin/users",response_class=HTMLResponse)
+def users_page(request:Request):
+    require_admin(request)
+    return HTMLResponse("""<!doctype html><html lang="fr"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Utilisateurs · PUIG VALUE</title><style>
+*{box-sizing:border-box}body{margin:0;background:#090e14;color:#f8fafc;font-family:Arial}.wrap{max-width:1050px;margin:auto;padding:24px}a{color:#ff2d86;text-decoration:none}.card{background:#151b24;border:1px solid #2d3748;border-radius:16px;padding:20px;margin:18px 0}.grid{display:grid;grid-template-columns:repeat(2,1fr);gap:12px}input,select{width:100%;padding:11px;border-radius:9px;border:1px solid #344050;background:#0d131b;color:white}button{padding:10px 14px;border:0;border-radius:9px;background:#ed0a72;color:white;font-weight:700;cursor:pointer}.secondary{background:#303a49}.danger{background:#7f1d1d}table{width:100%;border-collapse:collapse}td,th{padding:10px;border-bottom:1px solid #293241;text-align:left;font-size:13px}.muted{color:#9ca3af;font-size:12px}@media(max-width:700px){.grid{grid-template-columns:1fr}.tablewrap{overflow:auto}}</style></head><body><div class="wrap"><a href="/">← Retour à PUIG VALUE</a><h1>Gestion des utilisateurs</h1><div class="muted">Ton compte Render reste le Super Administrateur de secours.</div>
+<div class="card"><h2>Créer un compte</h2><div class="grid"><input id="u" placeholder="Identifiant"><input id="n" placeholder="Nom affiché"><input id="p" type="password" placeholder="Mot de passe (8 caractères minimum)"><select id="r"><option value="expert">Expert</option><option value="admin">Administrateur</option><option value="viewer">Consultation</option></select></div><button onclick="createU()">Créer le compte</button> <span id="msg" class="muted"></span></div>
+<div class="card"><h2>Comptes</h2><div class="tablewrap"><table><thead><tr><th>Identifiant</th><th>Nom</th><th>Rôle</th><th>Actif</th><th>Actions</th></tr></thead><tbody id="rows"></tbody></table></div></div></div>
+<script>async function api(url,opt={}){let r=await fetch(url,opt),d=await r.json().catch(()=>({}));if(!r.ok)throw Error(d.detail||"Erreur");return d}function esc(s){return String(s).replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]))}
+async function load(){let a=await api("/api/users");rows.innerHTML=a.map(x=>`<tr><td><b>${esc(x.username)}</b></td><td><input id="n${x.id}" value="${esc(x.display_name||"")}"></td><td><select id="r${x.id}"><option value="admin" ${x.role=="admin"?"selected":""}>Administrateur</option><option value="expert" ${x.role=="expert"?"selected":""}>Expert</option><option value="viewer" ${x.role=="viewer"?"selected":""}>Consultation</option></select></td><td><input id="a${x.id}" type="checkbox" ${x.active?"checked":""}></td><td><button class="secondary" onclick="save(${x.id})">Enregistrer</button> <button class="secondary" onclick="pwd(${x.id})">Mot de passe</button> <button class="danger" onclick="delU(${x.id},'${esc(x.username)}')">Supprimer</button></td></tr>`).join("")}
+async function createU(){try{await api("/api/users",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({username:u.value,display_name:n.value,password:p.value,role:r.value})});u.value=n.value=p.value="";msg.textContent="Compte créé.";load()}catch(e){msg.textContent=e.message}}
+async function save(id){try{await api("/api/users/"+id,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({display_name:document.getElementById("n"+id).value,role:document.getElementById("r"+id).value,active:document.getElementById("a"+id).checked})});alert("Compte mis à jour.")}catch(e){alert(e.message)}}
+async function pwd(id){let q=prompt("Nouveau mot de passe (8 caractères minimum) :");if(!q)return;try{await api("/api/users/"+id,{method:"PATCH",headers:{"Content-Type":"application/json"},body:JSON.stringify({password:q})});alert("Mot de passe modifié.")}catch(e){alert(e.message)}}
+async function delU(id,name){if(!confirm("Supprimer le compte "+name+" ?"))return;try{await api("/api/users/"+id,{method:"DELETE"});load()}catch(e){alert(e.message)}}load();</script></body></html>""")
 
 app.mount("/static", StaticFiles(directory=BASE_DIR / "app" / "static"), name="static")
 
@@ -299,6 +282,7 @@ def get_db():
             result TEXT NOT NULL
         )
     """)
+    ensure_users_table(conn)
     conn.commit()
     return conn
 
