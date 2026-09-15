@@ -631,6 +631,8 @@ async def estimate(req: EstimateRequest):
                 selection_method += f" jusqu'à {label}"
                 break
 
+    # Nombre maximal de références conservées après la recherche progressive.
+    target_n = 10 if req.property_type == "Appartement" else 12
     selected = selected[:target_n]
     expanded_radius = round(effective_radius or req.radius_m)
 
