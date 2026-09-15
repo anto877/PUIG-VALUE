@@ -124,6 +124,10 @@ button,input,select{font-size:16px} /* évite le zoom automatique iOS */
   .suggestion{display:flex;flex-direction:column;justify-content:center}
 }
 
+
+tr.excluded{opacity:.38;text-decoration:line-through}
+.comp-toggle{width:20px;height:20px;accent-color:#e41270;cursor:pointer}
+.selection-note{font-size:11px;color:var(--muted);margin:8px 0}
 </style>
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
@@ -167,7 +171,7 @@ button,input,select{font-size:16px} /* évite le zoom automatique iOS */
 <div id="status" class="status" style="margin-top:12px">Saisissez un bien pour commencer. Aucune référence n’est chargée au démarrage.</div>
 
 <div class="section">Comparables DVF retenus</div>
-<div class="scroll"><table><thead><tr><th>Adresse</th><th>Date</th><th>Prix</th><th>€/m²</th><th>Surface</th><th>Terrain</th><th>Pièces</th><th>Distance</th><th>Score</th><th>Valeur ajustée</th></tr></thead><tbody id="tbody"><tr id="emptyRow"><td colspan="10"><div class="empty-state">Aucune référence sélectionnée. Lancez une analyse pour afficher les comparables DVF.</div></td></tr></tbody></table></div>
+<div id="selectionNote" class="selection-note"></div><div class="scroll"><table><thead><tr><th>Utiliser</th><th>Adresse</th><th>Date</th><th>Prix</th><th>€/m²</th><th>Surface</th><th>Terrain</th><th>Pièces</th><th>Distance</th><th>Score</th><th>Valeur ajustée</th></tr></thead><tbody id="tbody"><tr id="emptyRow"><td colspan="11"><div class="empty-state">Aucune référence sélectionnée. Lancez une analyse pour afficher les comparables DVF.</div></td></tr></tbody></table></div>
 
 <div class="section">Carte géolocalisée des références</div>
 <div id="map" style="height:420px;border-radius:14px;border:1px solid var(--line);overflow:hidden"></div>
@@ -204,7 +208,7 @@ button,input,select{font-size:16px} /* évite le zoom automatique iOS */
 <div class="footer">PUIG VALUE™ WEB — DVF open-data / géocodage IGN. L'estimation reste une aide à l'expertise et doit être validée après visite.</div>
 </main>
 <script>
-const $=id=>document.getElementById(id); let mapObj=null; let charts={}; let selectedAddress=null; let addressTimer=null; let activeSuggestion=-1; let currentResult=null; let currentPayload=null;
+const $=id=>document.getElementById(id); let mapObj=null; let charts={}; let selectedAddress=null; let addressTimer=null; let activeSuggestion=-1; let currentResult=null; let currentPayload=null; let excludedComparableIds=new Set();
 function money(x){return Number.isFinite(+x)?(Math.round(+x/1000)*1000).toLocaleString("fr-FR")+" €":"—"}
 function ppm(x){return Number.isFinite(+x)?Math.round(+x).toLocaleString("fr-FR")+" €/m²":"—"}
 function payload(){
@@ -296,7 +300,7 @@ function clearResults(){
   $("confText").textContent="—"; $("confBar").style.width="0"; $("confLabel").textContent="—";
   $("analysis").textContent="—"; $("qualityImpact").textContent="—"; $("top").innerHTML="";
   $("alerts").textContent="—"; $("breakdown").innerHTML="";
-  $("tbody").innerHTML='<tr><td colspan="10"><div class="empty-state">Aucune référence sélectionnée. Lancez une analyse pour afficher les comparables DVF.</div></td></tr>';
+  $("tbody").innerHTML='<tr><td colspan="11"><div class="empty-state">Aucune référence sélectionnée. Lancez une analyse pour afficher les comparables DVF.</div></td></tr>';
   if(mapObj){mapObj.remove();mapObj=null;}
   Object.keys(charts).forEach(k=>destroyChart(k));
 }
@@ -306,7 +310,7 @@ async function estimate(){
  try{
   let r=await fetch("/api/estimate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload())});
   let d=await r.json();if(!r.ok)throw new Error(d.detail||"Erreur serveur");
-  currentPayload=payload(); currentResult=d;
+  currentPayload=payload(); currentResult=d; excludedComparableIds.clear();
   render(d);$("status").innerHTML=`<span class="ok"><b>Analyse terminée.</b></span> ${d.geocode.label}. ${d.search.comparables_selected} comparables retenus.`;
  }catch(e){$("status").innerHTML=`<span class="bad"><b>Erreur :</b> ${e.message}</span>`}
  finally{$("loader").style.display="none"}
@@ -314,6 +318,55 @@ async function estimate(){
 
 function destroyChart(name){ if(charts[name]){ charts[name].destroy(); charts[name]=null; } }
 
+function activeComparables(){
+  if(!currentResult)return [];
+  return currentResult.comparables.filter(x=>!excludedComparableIds.has(String(x.id_mutation)));
+}
+function toggleComparable(id){
+  id=String(id);
+  if(excludedComparableIds.has(id))excludedComparableIds.delete(id);else excludedComparableIds.add(id);
+  recalcFromSelection();
+}
+function recalcFromSelection(){
+  if(!currentResult||!currentPayload)return;
+  const comps=activeComparables();
+  if(!comps.length){
+    $("status").innerHTML='<span class="bad"><b>Aucune référence sélectionnée.</b> Cochez au moins un comparable.</span>';
+    return;
+  }
+  let num=0,den=0;
+  comps.forEach(c=>{const w=Number(c.weight)||Math.pow((Number(c.score)||0)/100,4);num+=(Number(c.adjusted_value)||0)*w;den+=w});
+  const base=den?num/den:0;
+  const q=currentResult.valuation.quality_adjustment||{};
+  const quality=base*(1+(Number(q.total)||0)/100);
+  const ex=Number(currentPayload.expert_value)||0;
+  const central=ex>0?quality*.90+ex*.10:quality;
+  const conf=Math.max(35,Math.min(98,Number(currentResult.confidence?.score)||70));
+  const pct=conf>=90?.03:conf>=80?.05:conf>=70?.07:conf>=60?.10:.15;
+  const v=currentResult.valuation;
+  v.comparables_value=Math.round(base);
+  v.quality_adjusted_value=Math.round(quality);
+  v.central=Math.round(central/1000)*1000;
+  v.low=Math.round((central*(1-pct))/1000)*1000;
+  v.high=Math.round((central*(1+pct))/1000)*1000;
+  // Recalcule les scénarios avec les mêmes rapports que le résultat initial lorsque disponibles.
+  const oldCentral=Number(v._selection_base_central||v.central)||v.central;
+  if(!v._selection_base_central)v._selection_base_central=oldCentral;
+  const pressure=Number(currentPayload.pressure)||50;
+  v.listing=Math.round((central*(1+Math.max(0,pressure-50)/1000))/1000)*1000;
+  v.quick_sale=Math.round((central*.95)/1000)*1000;
+  v.ambitious=Math.round((central*1.06)/1000)*1000;
+
+  $("central").textContent=money(v.central);$("low").textContent=money(v.low);$("high").textContent=money(v.high);
+  $("listing").textContent=money(v.listing);$("quick").textContent=money(v.quick_sale);$("ambitious").textContent=money(v.ambitious);
+  $("qualityImpact").innerHTML=`Base comparables sélectionnés : <b>${money(v.comparables_value)}</b><br>Après critères du bien : <b>${money(v.quality_adjusted_value)}</b><br>État : <b>${q.condition||0}%</b> · DPE : <b>${q.dpe||0}%</b> · Garage : <b>${q.garage||0}%</b> · Micro-localisation : <b>${q.micro_location||0}%</b> · Architecture : <b>${q.architecture||0}%</b> · Nuisances : <b>${q.nuisance||0}%</b><br>Ajustement total : <b>${q.total||0}%</b>.`;
+  $("selectionNote").innerHTML=`<b>${comps.length}</b> référence(s) utilisée(s) sur ${currentResult.comparables.length}. Décochez une vente pour l’exclure : la valeur, la carte et les régressions sont recalculées immédiatement.`;
+  // Refresh rows/top/map/charts without losing current exclusions
+  $("tbody").innerHTML=currentResult.comparables.map((x,i)=>`<tr class="${excludedComparableIds.has(String(x.id_mutation))?'excluded':''}"><td><input type="checkbox" class="comp-toggle" ${excludedComparableIds.has(String(x.id_mutation))?'':'checked'} onchange="toggleComparable('${x.id_mutation}')"></td><td>${x.address||x.parcel}</td><td>${x.date}</td><td>${money(x.price)}</td><td>${ppm(x.price_per_m2)}</td><td>${x.surface}</td><td>${x.land||"—"}</td><td>${x.rooms||"—"}</td><td>${Math.round(x.distance)} m</td><td><b>${x.score}</b></td><td>${money(x.adjusted_value)}</td></tr>`).join("");
+  $("top").innerHTML=comps.slice(0,5).map(x=>`<div class="comp"><b>${x.address||x.parcel}</b><div class="mini">${x.date} · ${money(x.price)} · ${ppm(x.price_per_m2)} · ${x.surface} m² · ${Math.round(x.distance)} m · score ${x.score}</div></div>`).join("");
+  const original=currentResult.comparables;
+  currentResult.comparables=comps;renderMap(currentResult);renderCharts(currentResult);currentResult.comparables=original;
+}
 function renderMap(d){
   if(typeof L==="undefined") return;
   if(mapObj){ mapObj.remove(); mapObj=null; }
@@ -378,7 +431,10 @@ function render(d){
  $("analysis").innerHTML=`Adresse reconnue : <b>${d.geocode.label}</b><br>Commune : <b>${d.geocode.city}</b> (${d.source.citycode})<br>Transactions résidentielles simples analysées : <b>${d.source.sales_scanned}</b><br>Méthode : <b>${d.search.selection_method}</b><br>Rayon effectif : <b>${d.search.effective_radius_m} m</b><br>Prix/m² médian : <b>${ppm(m.median_price_per_m2)}</b><br>Distance médiane : <b>${m.median_distance_m} m</b>.`;
  const q=v.quality_adjustment||{};
  $("qualityImpact").innerHTML=`Base comparables : <b>${money(v.comparables_value)}</b><br>Après critères du bien : <b>${money(v.quality_adjusted_value)}</b><br>État : <b>${q.condition||0}%</b> · DPE : <b>${q.dpe||0}%</b> · Garage : <b>${q.garage||0}%</b> · Micro-localisation : <b>${q.micro_location||0}%</b> · Architecture : <b>${q.architecture||0}%</b> · Nuisances : <b>${q.nuisance||0}%</b><br>Ajustement total : <b>${q.total||0}%</b>.`;
- $("tbody").innerHTML=d.comparables.map(x=>`<tr><td>${x.address||x.parcel}</td><td>${x.date}</td><td>${money(x.price)}</td><td>${ppm(x.price_per_m2)}</td><td>${x.surface}</td><td>${x.land||"—"}</td><td>${x.rooms||"—"}</td><td>${Math.round(x.distance)} m</td><td><b>${x.score}</b></td><td>${money(x.adjusted_value)}</td></tr>`).join("");
+ $("tbody").innerHTML=d.comparables.map((x,i)=>`<tr data-comp="${i}" class="${excludedComparableIds.has(String(x.id_mutation))?'excluded':''}">
+<td><input type="checkbox" class="comp-toggle" ${excludedComparableIds.has(String(x.id_mutation))?'':'checked'} onchange="toggleComparable('${x.id_mutation}')"></td>
+<td>${x.address||x.parcel}</td><td>${x.date}</td><td>${money(x.price)}</td><td>${ppm(x.price_per_m2)}</td><td>${x.surface}</td><td>${x.land||"—"}</td><td>${x.rooms||"—"}</td><td>${Math.round(x.distance)} m</td><td><b>${x.score}</b></td><td>${money(x.adjusted_value)}</td></tr>`).join("");
+ $("selectionNote").innerHTML=`<b>${d.comparables.length}</b> référence(s) utilisée(s). Vous pouvez décocher celles que vous jugez moins pertinentes ; le calcul sera actualisé immédiatement.`;
  $("top").innerHTML=d.comparables.slice(0,5).map(x=>`<div class="comp"><b>${x.address||x.parcel}</b><div class="mini">${x.date} · ${money(x.price)} · ${ppm(x.price_per_m2)} · ${x.surface} m² · ${Math.round(x.distance)} m · score ${x.score}</div></div>`).join("");
  $("alerts").innerHTML=d.alerts.length?d.alerts.map(x=>"• "+x).join("<br>"):"Aucune alerte automatique majeure.";
  renderMap(d); renderCharts(d)
@@ -405,7 +461,7 @@ async function saveCurrentEstimate(){
   if(title===null)return;
   const notes=prompt("Notes internes (facultatif) :","")??"";
   try{
-    const r=await fetch("/api/saved-estimates",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({title,notes,payload:currentPayload,result:currentResult})});
+    const r=await fetch("/api/saved-estimates",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({title,notes,payload:currentPayload,result:{...currentResult,comparables:activeComparables()}})});
     const d=await r.json();if(!r.ok)throw new Error(d.detail||"Erreur");
     $("status").innerHTML=`<span class="ok"><b>Estimation sauvegardée.</b></span> ${d.title}`;
     loadSavedHistory();
@@ -436,7 +492,7 @@ async function createExpertReport(){
   if(!currentResult||!currentPayload){$("status").innerHTML='<span class="bad">Lancez ou rechargez d’abord une estimation.</span>';return}
   const title=prompt("Titre du rapport :","Rapport d’expertise en évaluation immobilière");if(title===null)return;
   try{
-    const r=await fetch("/api/report",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({payload:currentPayload,result:currentResult,report_title:title})});
+    const r=await fetch("/api/report",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({payload:currentPayload,result:{...currentResult,comparables:activeComparables()},report_title:title})});
     if(!r.ok)throw new Error("Rapport impossible");
     const txt=await r.text(),blob=new Blob([txt],{type:"text/html"}),url=URL.createObjectURL(blob);
     window.open(url,"_blank");setTimeout(()=>URL.revokeObjectURL(url),60000);

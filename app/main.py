@@ -546,9 +546,9 @@ async def estimate(req: EstimateRequest):
             continue
         d = haversine(geo["lat"], geo["lon"], s["lat"], s["lon"])
         sale_addr = norm_address(s["address"])
-        same_building = bool(subject_addr and sale_addr and (
-            sale_addr in subject_addr or subject_addr in sale_addr
-        ))
+        # Appartement : "même immeuble" = même adresse normalisée exacte.
+        # On évite les tests par sous-chaîne (ex. 1 rue X vs 11 rue X).
+        same_building = bool(subject_addr and sale_addr and sale_addr == subject_addr)
         same_street = bool(subject_street and street_only(s["address"]) == subject_street)
         sc = comp_score(req, s, d)
         if same_building:
@@ -565,48 +565,67 @@ async def estimate(req: EstimateRequest):
             "same_street": same_street,
         })
 
-    # Hiérarchie stricte des comparables.
-    if req.property_type == "Appartement":
-        tier1 = [c for c in candidates if c["same_building"]]
-        tier2 = [c for c in candidates if c["same_street"] and c["distance"] <= 250]
-        tier3 = [c for c in candidates if c["distance"] <= 350]
-        tier4 = [c for c in candidates if c["distance"] <= 600]
-        tiers = [tier1, tier2, tier3, tier4]
-        target_n = 10
-    else:
-        tier1 = [c for c in candidates if c["distance"] <= 300]
-        tier2 = [c for c in candidates if c["distance"] <= 500]
-        tier3 = [c for c in candidates if c["distance"] <= 750]
-        tier4 = [c for c in candidates if c["distance"] <= min(req.radius_m, 1000)]
-        tiers = [tier1, tier2, tier3, tier4]
-        target_n = 12
-
+    # Hiérarchie géographique stricte V2.1.
+    # APPARTEMENT : s'il existe au moins une mutation à la même adresse exacte,
+    # seules ces mutations sont utilisées. On n'élargit que s'il n'y en a aucune.
+    # MAISON : 100 m -> 200 -> 300 -> 400 -> 500 -> 750 -> 1000 m.
     selected = []
     seen = set()
     effective_radius = 0
-    for tier in tiers:
-        tier = sorted(tier, key=lambda x: x["score"], reverse=True)
-        for c in tier:
-            if c["score"] < 60 or c["id_mutation"] in seen:
-                continue
-            seen.add(c["id_mutation"])
-            selected.append(c)
-            effective_radius = max(effective_radius, c["distance"])
-            if len(selected) >= target_n:
-                break
-        if len(selected) >= 5:
-            break
 
-    # En dernier recours seulement : rayon élargi mais plafonné à 1 km.
-    if len(selected) < 5:
-        fallback = sorted([c for c in candidates if c["distance"] <= min(req.radius_m, 1000) and c["score"] >= 60],
-                          key=lambda x: x["score"], reverse=True)
-        for c in fallback:
-            if c["id_mutation"] in seen:
-                continue
-            seen.add(c["id_mutation"]); selected.append(c)
-            effective_radius = max(effective_radius, c["distance"])
-            if len(selected) >= target_n:
+    if req.property_type == "Appartement":
+        same_address = sorted(
+            [c for c in candidates if c["same_building"] and c["score"] >= 60],
+            key=lambda x: (x["score"], -x["months"]), reverse=True
+        )
+        if same_address:
+            selected = same_address[:10]
+            seen = {c["id_mutation"] for c in selected}
+            effective_radius = max((c["distance"] for c in selected), default=0)
+            selection_method = "Appartement : références exclusivement à la même adresse"
+        else:
+            tiers = [
+                ("même rue / 100 m", [c for c in candidates if c["same_street"] and c["distance"] <= 100]),
+                ("même rue / 200 m", [c for c in candidates if c["same_street"] and c["distance"] <= 200]),
+                ("300 m", [c for c in candidates if c["distance"] <= 300]),
+                ("400 m", [c for c in candidates if c["distance"] <= 400]),
+                ("500 m", [c for c in candidates if c["distance"] <= 500]),
+                ("750 m", [c for c in candidates if c["distance"] <= 750]),
+                ("1000 m", [c for c in candidates if c["distance"] <= min(req.radius_m, 1000)]),
+            ]
+            selection_method = "Appartement : aucune vente à la même adresse, élargissement progressif"
+            for label, tier in tiers:
+                for c in sorted(tier, key=lambda x: x["score"], reverse=True):
+                    if c["score"] < 60 or c["id_mutation"] in seen:
+                        continue
+                    seen.add(c["id_mutation"]); selected.append(c)
+                    effective_radius = max(effective_radius, c["distance"])
+                    if len(selected) >= 10:
+                        break
+                if len(selected) >= 5:
+                    selection_method += f" jusqu'à {label}"
+                    break
+    else:
+        tiers = [
+            ("100 m", [c for c in candidates if c["distance"] <= 100]),
+            ("200 m", [c for c in candidates if c["distance"] <= 200]),
+            ("300 m", [c for c in candidates if c["distance"] <= 300]),
+            ("400 m", [c for c in candidates if c["distance"] <= 400]),
+            ("500 m", [c for c in candidates if c["distance"] <= 500]),
+            ("750 m", [c for c in candidates if c["distance"] <= 750]),
+            ("1000 m", [c for c in candidates if c["distance"] <= min(req.radius_m, 1000)]),
+        ]
+        selection_method = "Maison : élargissement progressif"
+        for label, tier in tiers:
+            for c in sorted(tier, key=lambda x: x["score"], reverse=True):
+                if c["score"] < 60 or c["id_mutation"] in seen:
+                    continue
+                seen.add(c["id_mutation"]); selected.append(c)
+                effective_radius = max(effective_radius, c["distance"])
+                if len(selected) >= 12:
+                    break
+            if len(selected) >= 5:
+                selection_method += f" jusqu'à {label}"
                 break
 
     selected = selected[:target_n]
@@ -678,7 +697,7 @@ async def estimate(req: EstimateRequest):
         "search": {
             "requested_radius_m": req.radius_m,
             "effective_radius_m": expanded_radius,
-            "selection_method": "Même immeuble/rue prioritaire pour appartements ; 300 m prioritaire pour maisons ; élargissement progressif et plafonné.",
+            "selection_method": selection_method,
             "surface_tolerance": req.surface_tolerance,
             "comparables_found": len(candidates),
             "comparables_selected": len(selected),
