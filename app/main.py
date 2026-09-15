@@ -7,13 +7,15 @@ import json
 import math
 import os
 import sqlite3
+import asyncio
+import html
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
 from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -25,9 +27,24 @@ CACHE_DIR.mkdir(parents=True, exist_ok=True)
 
 GEOCODE_URL = "https://data.geopf.fr/geocodage/search"
 DVF_BASE = "https://files.data.gouv.fr/geo-dvf/latest/csv"
+DVF_CACHE_MAX_AGE_DAYS = int(os.getenv("DVF_CACHE_MAX_AGE_DAYS", "7"))
+DVF_SYNC_INTERVAL_HOURS = int(os.getenv("DVF_SYNC_INTERVAL_HOURS", "24"))
 
 app = FastAPI(title="PUIG VALUE", version="1.0.0")
 app.mount("/static", StaticFiles(directory=BASE_DIR / "app" / "static"), name="static")
+
+
+class SavedEstimateRequest(BaseModel):
+    title: str = Field(default="", max_length=200)
+    notes: str = Field(default="", max_length=5000)
+    payload: dict[str, Any]
+    result: dict[str, Any]
+
+
+class ReportRequest(BaseModel):
+    payload: dict[str, Any]
+    result: dict[str, Any]
+    report_title: str = Field(default="Rapport d’expertise en évaluation immobilière", max_length=250)
 
 
 class EstimateRequest(BaseModel):
@@ -50,6 +67,7 @@ class EstimateRequest(BaseModel):
 
 
 def get_db():
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
     conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     conn.execute("""
@@ -57,6 +75,18 @@ def get_db():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT NOT NULL,
             address TEXT NOT NULL,
+            payload TEXT NOT NULL,
+            result TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS saved_estimations(
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            address TEXT NOT NULL,
+            notes TEXT NOT NULL DEFAULT '',
             payload TEXT NOT NULL,
             result TEXT NOT NULL
         )
@@ -73,6 +103,29 @@ def home():
 @app.get("/api/health")
 def health():
     return {"ok": True, "service": "PUIG VALUE WEB", "time": datetime.utcnow().isoformat() + "Z"}
+
+
+async def enrich_location(citycode: str) -> dict[str, str]:
+    if not citycode:
+        return {}
+    try:
+        async with httpx.AsyncClient(timeout=10.0, follow_redirects=True) as client:
+            r = await client.get(
+                f"https://geo.api.gouv.fr/communes/{citycode}",
+                params={"fields": "nom,code,codesPostaux,departement,region"}
+            )
+        if not r.is_success:
+            return {}
+        d = r.json()
+        return {
+            "commune": d.get("nom") or "",
+            "department": (d.get("departement") or {}).get("nom") or "",
+            "department_code": (d.get("departement") or {}).get("code") or "",
+            "region": (d.get("region") or {}).get("nom") or "",
+            "region_code": (d.get("region") or {}).get("code") or "",
+        }
+    except Exception:
+        return {}
 
 
 async def geocode_address(address: str) -> dict[str, Any]:
@@ -145,21 +198,86 @@ def dept_from_insee(insee: str) -> str:
     return insee[:2]
 
 
-async def ensure_dvf_file(year: int, citycode: str) -> Path:
+async def ensure_dvf_file(year: int, citycode: str, force: bool = False) -> Path:
     dept = dept_from_insee(citycode)
     local = CACHE_DIR / f"dvf_{year}_{citycode}.csv"
-    if local.exists() and local.stat().st_size > 50:
-        return local
+    if local.exists() and local.stat().st_size > 50 and not force:
+        age_seconds = datetime.now().timestamp() - local.stat().st_mtime
+        if age_seconds < DVF_CACHE_MAX_AGE_DAYS * 86400:
+            return local
 
     url = f"{DVF_BASE}/{year}/communes/{dept}/{citycode}.csv"
     timeout = httpx.Timeout(60.0)
     async with httpx.AsyncClient(timeout=timeout, follow_redirects=True) as client:
-        r = await client.get(url)
+        r = await client.get(url, headers={"User-Agent": "PUIG-VALUE/2.0"})
     if r.status_code == 404:
+        if local.exists() and local.stat().st_size > 50:
+            return local
         raise FileNotFoundError(url)
     r.raise_for_status()
-    local.write_bytes(r.content)
+    tmp = local.with_suffix(".csv.tmp")
+    tmp.write_bytes(r.content)
+    tmp.replace(local)
     return local
+
+
+def cached_dvf_entries():
+    entries = []
+    for p in sorted(CACHE_DIR.glob("dvf_*_*.csv")):
+        try:
+            parts = p.stem.split("_")
+            entries.append({
+                "year": int(parts[1]),
+                "citycode": parts[2],
+                "path": p,
+                "updated_at": datetime.fromtimestamp(p.stat().st_mtime).isoformat(),
+            })
+        except Exception:
+            continue
+    return entries
+
+
+async def sync_cached_dvf(force: bool = False):
+    updated, failed = [], []
+    for e in cached_dvf_entries():
+        try:
+            p = await ensure_dvf_file(e["year"], e["citycode"], force=force)
+            updated.append({"year": e["year"], "citycode": e["citycode"], "updated_at": datetime.fromtimestamp(p.stat().st_mtime).isoformat()})
+        except Exception as exc:
+            failed.append({"year": e["year"], "citycode": e["citycode"], "error": str(exc)})
+    return {"updated": updated, "failed": failed}
+
+
+async def dvf_sync_loop():
+    while True:
+        try:
+            await sync_cached_dvf(force=False)
+        except Exception:
+            pass
+        await asyncio.sleep(max(1, DVF_SYNC_INTERVAL_HOURS) * 3600)
+
+
+@app.on_event("startup")
+async def startup_tasks():
+    get_db().close()
+    asyncio.create_task(dvf_sync_loop())
+
+
+@app.get("/api/dvf/status")
+def dvf_status():
+    entries = cached_dvf_entries()
+    return {
+        "cache_entries": len(entries),
+        "last_sync": max((e["updated_at"] for e in entries), default=None),
+        "check_every_hours": DVF_SYNC_INTERVAL_HOURS,
+        "cache_max_age_days": DVF_CACHE_MAX_AGE_DAYS,
+        "official_schedule": "Publication DVF semestrielle : avril et octobre.",
+    }
+
+
+@app.post("/api/dvf/sync")
+async def dvf_sync_now():
+    return await sync_cached_dvf(force=True)
 
 
 def fnum(v: Any) -> float:
@@ -398,6 +516,7 @@ def confidence(comps, expert_present: bool):
 async def estimate(req: EstimateRequest):
     geo = await geocode_address(req.address)
     citycode = geo["citycode"]
+    geo["territory"] = await enrich_location(citycode)
 
     files = []
     missing = []
@@ -595,15 +714,240 @@ async def estimate(req: EstimateRequest):
         "comparables": selected,
     }
 
+    return result
+
+
+@app.post("/api/saved-estimates")
+def save_estimate(req: SavedEstimateRequest):
+    address = str(req.payload.get("address") or req.result.get("geocode", {}).get("label") or "")
+    title = req.title.strip() or address or "Estimation"
+    now = datetime.utcnow().isoformat() + "Z"
     with get_db() as conn:
         cur = conn.execute(
-            "INSERT INTO valuations(created_at,address,payload,result) VALUES(?,?,?,?)",
-            (datetime.utcnow().isoformat()+"Z", req.address, req.model_dump_json(), json.dumps(result, ensure_ascii=False))
+            "INSERT INTO saved_estimations(created_at,updated_at,title,address,notes,payload,result) VALUES(?,?,?,?,?,?,?)",
+            (now, now, title, address, req.notes, json.dumps(req.payload, ensure_ascii=False), json.dumps(req.result, ensure_ascii=False))
         )
         conn.commit()
-        result["valuation_id"] = cur.lastrowid
+        sid = cur.lastrowid
+    return {"id": sid, "created_at": now, "title": title, "address": address}
 
-    return result
+
+@app.get("/api/saved-estimates")
+def list_saved_estimates(limit: int = Query(default=50, ge=1, le=200)):
+    with get_db() as conn:
+        rows = conn.execute(
+            "SELECT id,created_at,updated_at,title,address,notes,result FROM saved_estimations ORDER BY updated_at DESC LIMIT ?",
+            (limit,)
+        ).fetchall()
+    out = []
+    for row in rows:
+        result = json.loads(row["result"])
+        out.append({
+            "id": row["id"], "created_at": row["created_at"], "updated_at": row["updated_at"],
+            "title": row["title"], "address": row["address"], "notes": row["notes"],
+            "central": result.get("valuation", {}).get("central"),
+            "confidence": result.get("confidence", {}).get("score"),
+        })
+    return out
+
+
+@app.get("/api/saved-estimates/{estimate_id}")
+def get_saved_estimate(estimate_id: int):
+    with get_db() as conn:
+        row = conn.execute("SELECT * FROM saved_estimations WHERE id=?", (estimate_id,)).fetchone()
+    if not row:
+        raise HTTPException(404, "Estimation sauvegardée introuvable.")
+    return {
+        "id": row["id"], "created_at": row["created_at"], "updated_at": row["updated_at"],
+        "title": row["title"], "address": row["address"], "notes": row["notes"],
+        "payload": json.loads(row["payload"]), "result": json.loads(row["result"]),
+    }
+
+
+@app.delete("/api/saved-estimates/{estimate_id}")
+def delete_saved_estimate(estimate_id: int):
+    with get_db() as conn:
+        cur = conn.execute("DELETE FROM saved_estimations WHERE id=?", (estimate_id,))
+        conn.commit()
+    if cur.rowcount == 0:
+        raise HTTPException(404, "Estimation sauvegardée introuvable.")
+    return {"ok": True}
+
+
+def _esc(value):
+    return html.escape(str(value if value is not None else ""))
+
+
+def _euro(value):
+    try:
+        return f"{round(float(value)/1000)*1000:,.0f} €".replace(",", " ")
+    except Exception:
+        return "—"
+
+
+def _svg_scatter(comps, xkey, regression, title, x_label):
+    W, H = 720, 300
+    pl, pr, pt, pb = 65, 25, 35, 45
+    pts = []
+    for comp in comps:
+        try:
+            x = float(comp.get(xkey, 0))
+            y = float(comp.get("price_per_m2", 0))
+            if y > 0:
+                pts.append((x, y))
+        except Exception:
+            pass
+    if not pts:
+        return ""
+    xs = [x for x,_ in pts]
+    ys = [y for _,y in pts]
+    xmin, xmax, ymin, ymax = min(xs), max(xs), min(ys), max(ys)
+    if xmax == xmin: xmax += 1
+    if ymax == ymin: ymax += 1
+    my = (ymax-ymin)*0.08
+    ymin = max(0, ymin-my); ymax += my
+    sx = lambda x: pl + (x-xmin)/(xmax-xmin)*(W-pl-pr)
+    sy = lambda y: pt + (ymax-y)/(ymax-ymin)*(H-pt-pb)
+    circles = "".join([f'<circle cx="{sx(x):.1f}" cy="{sy(y):.1f}" r="4" fill="#e41270" opacity=".75"/>' for x,y in pts])
+    line = ""
+    r2 = ""
+    if regression:
+        y1 = regression["intercept"] + regression["slope"]*xmin
+        y2 = regression["intercept"] + regression["slope"]*xmax
+        line = f'<line x1="{sx(xmin):.1f}" y1="{sy(y1):.1f}" x2="{sx(xmax):.1f}" y2="{sy(y2):.1f}" stroke="#111827" stroke-width="2"/>'
+        r2 = f'R² = {regression["r2"]:.2f}'
+    grid = ""
+    labels = ""
+    for i in range(5):
+        yy = pt + i*(H-pt-pb)/4
+        val = ymax - i*(ymax-ymin)/4
+        grid += f'<line x1="{pl}" y1="{yy:.1f}" x2="{W-pr}" y2="{yy:.1f}" stroke="#e5e7eb"/>'
+        labels += f'<text x="{pl-8}" y="{yy+4:.1f}" text-anchor="end" font-size="10" fill="#4b5563">{round(val)}</text>'
+    return (
+        f'<svg viewBox="0 0 {W} {H}" width="100%">'
+        f'<text x="{pl}" y="20" font-size="14" font-weight="700">{_esc(title)}</text>'
+        f'{grid}{labels}'
+        f'<line x1="{pl}" y1="{H-pb}" x2="{W-pr}" y2="{H-pb}" stroke="#6b7280"/>'
+        f'<line x1="{pl}" y1="{pt}" x2="{pl}" y2="{H-pb}" stroke="#6b7280"/>'
+        f'{circles}{line}'
+        f'<text x="{W/2}" y="{H-10}" text-anchor="middle" font-size="11">{_esc(x_label)}</text>'
+        f'<text x="16" y="{H/2}" transform="rotate(-90 16 {H/2})" text-anchor="middle" font-size="11">Prix au m² (€)</text>'
+        f'<text x="{W-pr}" y="20" text-anchor="end" font-size="11" fill="#4b5563">{r2}</text>'
+        '</svg>'
+    )
+
+
+@app.post("/api/report", response_class=HTMLResponse)
+def build_report(req: ReportRequest):
+    p = req.payload
+    r = req.result
+    g = r.get("geocode", {})
+    territory = g.get("territory") or {}
+    v = r.get("valuation", {})
+    m = r.get("market", {})
+    reg = r.get("regression", {})
+    comps = r.get("comparables", [])[:12]
+    q = v.get("quality_adjustment", {})
+    now = datetime.now().strftime("%d/%m/%Y")
+    address = g.get("label") or p.get("address") or ""
+    region = territory.get("region") or ""
+    department = territory.get("department") or ""
+    commune = territory.get("commune") or g.get("city") or ""
+    radius = r.get("search", {}).get("effective_radius_m", "")
+    method = r.get("search", {}).get("selection_method", "")
+    surface_svg = _svg_scatter(comps, "surface", reg.get("surface_vs_ppm"), "Régression : surface et prix au m²", "Surface habitable (m²)")
+    distance_svg = _svg_scatter(comps, "distance", reg.get("distance_vs_ppm"), "Régression : distance et prix au m²", "Distance au bien (m)")
+
+    comp_rows = "".join(
+        f"<tr><td>{_esc(c.get('address') or c.get('parcel'))}</td><td>{_esc(c.get('date'))}</td>"
+        f"<td>{_euro(c.get('price'))}</td><td>{_esc(round(c.get('price_per_m2',0)))} €/m²</td>"
+        f"<td>{_esc(c.get('surface'))} m²</td><td>{_esc(round(c.get('distance',0)))} m</td><td>{_esc(c.get('score'))}/100</td></tr>"
+        for c in comps
+    )
+
+    qual_parts = []
+    for key, label in [
+        ("condition","État général"),("dpe","DPE"),("garage","Garage/stationnement"),
+        ("micro_location","Micro-localisation"),("architecture","Architecture/cachet"),("nuisance","Nuisances")
+    ]:
+        val = float(q.get(key,0) or 0)
+        if abs(val) >= .01:
+            qual_parts.append(f"{label}: {val:+.2f}%")
+    qualitative = " ; ".join(qual_parts) if qual_parts else "Aucune correction qualitative significative."
+
+    surf_reg = reg.get("surface_vs_ppm") or {}
+    dist_reg = reg.get("distance_vs_ppm") or {}
+
+    report_html = f'''<!doctype html>
+<html lang="fr"><head><meta charset="utf-8"><title>{_esc(req.report_title)}</title>
+<style>
+@page{{size:A4;margin:18mm}}
+body{{font-family:Arial,sans-serif;color:#1f2937;line-height:1.45;font-size:11pt;margin:0}}
+h1{{font-size:23pt;margin:0 0 6px}} h2{{font-size:16pt;margin-top:26px;border-bottom:2px solid #e41270;padding-bottom:5px}}
+h3{{font-size:12pt;margin-top:18px}} .brand{{color:#e41270;font-weight:800;letter-spacing:.04em}}
+.muted{{color:#6b7280}} .summary{{display:grid;grid-template-columns:repeat(3,1fr);gap:8px;margin:15px 0}}
+.box{{border:1px solid #d1d5db;border-radius:8px;padding:10px}} .value{{font-size:18pt;font-weight:800}}
+table{{width:100%;border-collapse:collapse;font-size:9pt}} th,td{{border-bottom:1px solid #e5e7eb;padding:6px;text-align:left}} th{{background:#f3f4f6}}
+.callout{{border-left:4px solid #e41270;background:#f9fafb;padding:10px 12px;margin:12px 0}}
+.pagebreak{{page-break-before:always}} svg{{max-width:100%;height:auto}}
+@media print{{button{{display:none}}}}
+</style></head><body>
+<div class="brand">PUIG EXPERTISES · PUIG VALUE™</div>
+<h1>{_esc(req.report_title)}</h1>
+<div class="muted">Bien : {_esc(address)} · Rapport généré le {now}</div>
+<div class="summary">
+<div class="box"><div class="muted">Valeur vénale centrale</div><div class="value">{_euro(v.get("central"))}</div></div>
+<div class="box"><div class="muted">Fourchette</div><div class="value">{_euro(v.get("low"))} – {_euro(v.get("high"))}</div></div>
+<div class="box"><div class="muted">Confiance</div><div class="value">{_esc(r.get("confidence",{}).get("score","—"))}/100</div></div>
+</div>
+
+<h2>1. Objet de la mission et principe d’évaluation</h2>
+<p>Le présent document constitue une analyse d’évaluation immobilière fondée sur une approche comparative de marché, complétée par une analyse statistique des transactions DVF et par des corrections qualitatives liées aux caractéristiques propres du bien.</p>
+
+<h2>2. Situation géographique : du territoire au micro-secteur</h2>
+<h3>2.1 Région et département</h3>
+<p>Le bien est situé en <strong>{_esc(region or "territoire non renseigné")}</strong>, dans le département <strong>{_esc(department or "non renseigné")}</strong>.</p>
+<h3>2.2 Commune</h3>
+<p>Il se situe sur la commune de <strong>{_esc(commune)}</strong> ({_esc(g.get("postcode",""))}).</p>
+<h3>2.3 Secteur et environnement immédiat</h3>
+<p>Le micro-marché a été recherché autour de l’adresse <strong>{_esc(address)}</strong>. Le rayon effectivement utilisé est d’environ <strong>{_esc(radius)} m</strong>. Méthode : {_esc(method)}.</p>
+<div class="callout">Distance médiane : <strong>{_esc(m.get("median_distance_m","—"))} m</strong> · Prix médian observé : <strong>{_esc(m.get("median_price_per_m2","—"))} €/m²</strong>.</div>
+
+<h2>3. Description synthétique du bien</h2>
+<table><tr><th>Type</th><th>Surface</th><th>Terrain</th><th>Pièces</th><th>État</th><th>DPE</th></tr>
+<tr><td>{_esc(p.get("property_type",""))}</td><td>{_esc(p.get("surface",""))} m²</td><td>{_esc(p.get("land",0))} m²</td><td>{_esc(p.get("rooms",0))}</td><td>{_esc(p.get("condition",""))}/10</td><td>{_esc(p.get("dpe",""))}</td></tr></table>
+
+<h2>4. Méthodologie comparative</h2>
+<p>Pour les appartements, la priorité est donnée au même immeuble puis à la même rue. Pour les maisons, la priorité est donnée aux références situées dans un rayon proche de 300 m, avant élargissement progressif si nécessaire. Chaque mutation reçoit un score de pertinence et un poids non linéaire.</p>
+<p>Valeur issue des comparables : <strong>{_euro(v.get("comparables_value"))}</strong>. Après correction des caractéristiques : <strong>{_euro(v.get("quality_adjusted_value"))}</strong>.</p>
+<p>{_esc(qualitative)} Ajustement total : <strong>{_esc(q.get("total",0))}%</strong>.</p>
+
+<h2>5. Références de marché retenues</h2>
+<table><thead><tr><th>Adresse</th><th>Date</th><th>Prix</th><th>€/m²</th><th>Surface</th><th>Distance</th><th>Score</th></tr></thead><tbody>{comp_rows}</tbody></table>
+
+<div class="pagebreak"></div>
+<h2>6. Analyse statistique et courbes de régression</h2>
+<p>Les courbes permettent d’observer la relation entre les caractéristiques des références et leur niveau de prix. Le coefficient R² est présenté pour mesurer la force de la relation linéaire.</p>
+{surface_svg}
+<p>Pente surface : <strong>{_esc(round(surf_reg.get("slope",0),2))}</strong> €/m² par m² · R² : <strong>{_esc(round(surf_reg.get("r2",0),2))}</strong>.</p>
+{distance_svg}
+<p>Pente distance : <strong>{_esc(round(dist_reg.get("slope",0),2))}</strong> €/m² par mètre · R² : <strong>{_esc(round(dist_reg.get("r2",0),2))}</strong>.</p>
+
+<h2>7. Incidence du DPE et de l’état</h2>
+<p>DPE retenu : <strong>{_esc(p.get("dpe",""))}</strong>. État retenu : <strong>{_esc(p.get("condition",""))}/10</strong>. Les corrections qualitatives prennent aussi en compte le stationnement, la micro-localisation, l’architecture et les nuisances.</p>
+
+<h2>8. Synthèse et conclusion de valeur</h2>
+<div class="callout"><strong>Valeur vénale centrale : {_euro(v.get("central"))}</strong><br>
+Fourchette : {_euro(v.get("low"))} à {_euro(v.get("high"))}<br>
+Prix de commercialisation indicatif : {_euro(v.get("listing"))}<br>
+Scénario de vente rapide : {_euro(v.get("quick_sale"))}</div>
+
+<h2>9. Sources et réserves</h2>
+<p>Sources principales : DVF géolocalisé, géocodage IGN/Géoplateforme, données territoriales publiques et informations saisies lors de l’expertise. La conclusion doit être rapprochée des constatations de visite et des documents juridiques, techniques et urbanistiques.</p>
+<p class="muted">Rapport généré uniquement à la demande depuis PUIG VALUE™.</p>
+<button onclick="window.print()">Imprimer / enregistrer en PDF</button>
+</body></html>'''
+    return HTMLResponse(report_html)
 
 
 @app.get("/api/valuations")

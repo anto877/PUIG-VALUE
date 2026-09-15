@@ -132,9 +132,9 @@ button,input,select{font-size:16px} /* évite le zoom automatique iOS */
 <body>
 <header><div class="wrap top">
 <div class="brand"><div class="logo">PV</div><div><h1>PUIG VALUE™ WEB</h1><div class="sub">DVF réel · Géocodage IGN · historique des estimations</div></div></div>
-<div class="row no-print header-actions"><button class="ghost" onclick="loadHistory()">Historique</button><button class="ghost" onclick="window.print()">PDF</button></div>
+<div class="row no-print header-actions"><button class="ghost" onclick="syncDVF()">Synchroniser DVF</button><button class="ghost" onclick="loadSavedHistory()">Estimations sauvegardées</button><button class="ghost" onclick="window.print()">PDF écran</button></div>
 </div></header>
-<main class="wrap"><div class="layout">
+<main class="wrap"><div id="dvfSyncStatus" class="mini" style="padding:8px 2px 10px">DVF : vérification de la synchronisation…</div><div class="layout">
 <section class="card">
 <h2>Nouvelle estimation</h2>
 <div class="grid">
@@ -161,7 +161,7 @@ button,input,select{font-size:16px} /* évite le zoom automatique iOS */
 <div><label>Nuisances</label><select id="nuisance"><option value="0">Aucune</option><option value="1">Faibles</option><option value="2">Moyennes</option><option value="3">Fortes</option></select></div>
 </div>
 <div class="row no-print" style="margin-top:14px">
-<button class="primary" onclick="estimate()">Analyser le bien</button>
+<button class="primary" onclick="estimate()">Analyser le bien</button><button class="ghost" onclick="saveCurrentEstimate()">Sauvegarder</button><button class="ghost" onclick="createExpertReport()">Créer le rapport d’expertise</button>
 <div id="loader" class="loader"><div class="spin"></div><span class="mini">Géocodage et analyse DVF… le premier appel peut prendre quelques secondes.</span></div>
 </div>
 <div id="status" class="status" style="margin-top:12px">Saisissez un bien pour commencer. Aucune référence n’est chargée au démarrage.</div>
@@ -198,13 +198,13 @@ button,input,select{font-size:16px} /* évite le zoom automatique iOS */
 <div class="section">Impact des critères du bien</div><div id="qualityImpact" class="mini">—</div>
 <div class="section">Top comparables</div><div id="top"></div>
 <div class="section">Contrôle contradictoire</div><div id="alerts" class="mini">—</div>
-<div class="section">Historique récent</div><div id="history" class="mini">Clique sur « Historique » pour afficher les dernières estimations.</div>
+<div class="section">Estimations sauvegardées</div><div id="history" class="mini">Aucune estimation chargée.</div>
 </aside>
 </div>
 <div class="footer">PUIG VALUE™ WEB — DVF open-data / géocodage IGN. L'estimation reste une aide à l'expertise et doit être validée après visite.</div>
 </main>
 <script>
-const $=id=>document.getElementById(id); let mapObj=null; let charts={}; let selectedAddress=null; let addressTimer=null; let activeSuggestion=-1;
+const $=id=>document.getElementById(id); let mapObj=null; let charts={}; let selectedAddress=null; let addressTimer=null; let activeSuggestion=-1; let currentResult=null; let currentPayload=null;
 function money(x){return Number.isFinite(+x)?(Math.round(+x/1000)*1000).toLocaleString("fr-FR")+" €":"—"}
 function ppm(x){return Number.isFinite(+x)?Math.round(+x).toLocaleString("fr-FR")+" €/m²":"—"}
 function payload(){
@@ -225,7 +225,7 @@ function payload(){
   micro_location:+$("micro_location").value||7,
   architecture:+$("architecture").value||7,
   nuisance:+$("nuisance").value||0,
-  years:[2021,2022,2023,2024,2025]
+  years:Array.from({length:6},(_,i)=>new Date().getFullYear()-5+i)
  }
 }
 
@@ -306,6 +306,7 @@ async function estimate(){
  try{
   let r=await fetch("/api/estimate",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify(payload())});
   let d=await r.json();if(!r.ok)throw new Error(d.detail||"Erreur serveur");
+  currentPayload=payload(); currentResult=d;
   render(d);$("status").innerHTML=`<span class="ok"><b>Analyse terminée.</b></span> ${d.geocode.label}. ${d.search.comparables_selected} comparables retenus.`;
  }catch(e){$("status").innerHTML=`<span class="bad"><b>Erreur :</b> ${e.message}</span>`}
  finally{$("loader").style.display="none"}
@@ -380,14 +381,68 @@ function render(d){
  $("tbody").innerHTML=d.comparables.map(x=>`<tr><td>${x.address||x.parcel}</td><td>${x.date}</td><td>${money(x.price)}</td><td>${ppm(x.price_per_m2)}</td><td>${x.surface}</td><td>${x.land||"—"}</td><td>${x.rooms||"—"}</td><td>${Math.round(x.distance)} m</td><td><b>${x.score}</b></td><td>${money(x.adjusted_value)}</td></tr>`).join("");
  $("top").innerHTML=d.comparables.slice(0,5).map(x=>`<div class="comp"><b>${x.address||x.parcel}</b><div class="mini">${x.date} · ${money(x.price)} · ${ppm(x.price_per_m2)} · ${x.surface} m² · ${Math.round(x.distance)} m · score ${x.score}</div></div>`).join("");
  $("alerts").innerHTML=d.alerts.length?d.alerts.map(x=>"• "+x).join("<br>"):"Aucune alerte automatique majeure.";
- renderMap(d); renderCharts(d); loadHistory()
+ renderMap(d); renderCharts(d)
 }
-async function loadHistory(){
- try{
-  let r=await fetch("/api/valuations?limit=8"),a=await r.json();
-  $("history").innerHTML=a.length?a.map(x=>`<div class="comp"><b>${x.address}</b><div class="mini">${money(x.central)} · confiance ${Math.round(x.confidence)}/100 · ${new Date(x.created_at).toLocaleString("fr-FR")}</div></div>`).join(""):"Aucune estimation enregistrée.";
- }catch(e){$("history").textContent="Historique indisponible."}
+async function refreshDVFStatus(){
+  try{
+    const r=await fetch("/api/dvf/status"),d=await r.json();
+    const last=d.last_sync?new Date(d.last_sync).toLocaleString("fr-FR"):"pas encore de cache";
+    $("dvfSyncStatus").innerHTML=`DVF : contrôle automatique toutes les <b>${d.check_every_hours} h</b> · revérification après <b>${d.cache_max_age_days} jours</b> · dernière synchro locale : <b>${last}</b> · publication officielle : avril / octobre.`;
+  }catch(e){$("dvfSyncStatus").textContent="DVF : statut de synchronisation indisponible."}
 }
+async function syncDVF(){
+  $("dvfSyncStatus").textContent="DVF : synchronisation en cours…";
+  try{
+    const r=await fetch("/api/dvf/sync",{method:"POST"}),d=await r.json();
+    if(!r.ok)throw new Error("échec");
+    $("dvfSyncStatus").innerHTML=`DVF synchronisé : <b>${d.updated.length}</b> fichier(s) vérifié(s)${d.failed.length?` · ${d.failed.length} échec(s)`:``}.`;
+    setTimeout(refreshDVFStatus,800);
+  }catch(e){$("dvfSyncStatus").innerHTML='<span class="bad">Synchronisation DVF impossible.</span>'}
+}
+async function saveCurrentEstimate(){
+  if(!currentResult||!currentPayload){$("status").innerHTML='<span class="bad">Lancez d’abord une estimation.</span>';return}
+  const title=prompt("Nom du dossier :",currentResult.geocode?.label||currentPayload.address||"Estimation");
+  if(title===null)return;
+  const notes=prompt("Notes internes (facultatif) :","")??"";
+  try{
+    const r=await fetch("/api/saved-estimates",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({title,notes,payload:currentPayload,result:currentResult})});
+    const d=await r.json();if(!r.ok)throw new Error(d.detail||"Erreur");
+    $("status").innerHTML=`<span class="ok"><b>Estimation sauvegardée.</b></span> ${d.title}`;
+    loadSavedHistory();
+  }catch(e){$("status").innerHTML=`<span class="bad">Sauvegarde impossible : ${e.message}</span>`}
+}
+async function loadSavedHistory(){
+  try{
+    const r=await fetch("/api/saved-estimates?limit=30"),a=await r.json();
+    $("history").innerHTML=a.length?a.map(x=>`<div class="comp"><b>${x.title}</b><div class="mini">${x.address}<br>${money(x.central)} · confiance ${Math.round(x.confidence||0)}/100 · ${new Date(x.updated_at).toLocaleString("fr-FR")}</div><div class="row no-print" style="margin-top:6px"><button class="ghost" onclick="openSavedEstimate(${x.id})">Ouvrir</button><button class="ghost" onclick="deleteSavedEstimate(${x.id})">Supprimer</button></div></div>`).join(""):"Aucune estimation sauvegardée.";
+  }catch(e){$("history").textContent="Impossible de charger les sauvegardes."}
+}
+async function openSavedEstimate(id){
+  const r=await fetch(`/api/saved-estimates/${id}`),d=await r.json();
+  if(!r.ok){alert(d.detail||"Introuvable");return}
+  const p=d.payload;
+  ["address","property_type","surface","land","rooms","condition","dpe","radius_m","surface_tolerance","pressure","expert_value","micro_location","architecture","nuisance"].forEach(k=>{if($(k)&&p[k]!==undefined&&p[k]!==null)$(k).value=p[k]});
+  if($("garage"))$("garage").value=String(!!p.garage);
+  $("postcode").value=d.result.geocode?.postcode||"";$("city").value=d.result.geocode?.city||"";
+  currentPayload=p;currentResult=d.result;render(d.result);
+  $("status").innerHTML=`<span class="ok"><b>Dossier rechargé :</b></span> ${d.title}`;
+  window.scrollTo({top:0,behavior:"smooth"});
+}
+async function deleteSavedEstimate(id){
+  if(!confirm("Supprimer cette estimation ?"))return;
+  await fetch(`/api/saved-estimates/${id}`,{method:"DELETE"});loadSavedHistory();
+}
+async function createExpertReport(){
+  if(!currentResult||!currentPayload){$("status").innerHTML='<span class="bad">Lancez ou rechargez d’abord une estimation.</span>';return}
+  const title=prompt("Titre du rapport :","Rapport d’expertise en évaluation immobilière");if(title===null)return;
+  try{
+    const r=await fetch("/api/report",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({payload:currentPayload,result:currentResult,report_title:title})});
+    if(!r.ok)throw new Error("Rapport impossible");
+    const txt=await r.text(),blob=new Blob([txt],{type:"text/html"}),url=URL.createObjectURL(blob);
+    window.open(url,"_blank");setTimeout(()=>URL.revokeObjectURL(url),60000);
+  }catch(e){$("status").innerHTML=`<span class="bad">${e.message}</span>`}
+}
+refreshDVFStatus();
 clearResults();
 </script>
 </body></html>
