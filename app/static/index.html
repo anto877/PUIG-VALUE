@@ -136,7 +136,7 @@ tr.excluded{opacity:.38;text-decoration:line-through}
 <body>
 <header><div class="wrap top">
 <div class="brand"><div class="logo">PV</div><div><h1>PUIG VALUE™ WEB</h1><div class="sub">DVF réel · Géocodage IGN · historique des estimations</div></div></div>
-<div class="row no-print header-actions"><button class="ghost" onclick="syncDVF()">Synchroniser DVF</button><button class="ghost" onclick="loadSavedHistory()">Estimations sauvegardées</button><button class="ghost" onclick="window.print()">PDF écran</button></div>
+<div class="row no-print header-actions"><button class="ghost" onclick="syncDVF()">Synchroniser DVF</button><button class="ghost" onclick="loadSavedHistory()">Estimations sauvegardées</button><button class="ghost" onclick="window.print()">PDF écran</button><button class="ghost" onclick="logout()">Déconnexion</button></div>
 </div></header>
 <main class="wrap"><div id="dvfSyncStatus" class="mini" style="padding:8px 2px 10px">DVF : vérification de la synchronisation…</div><div class="layout">
 <section class="card">
@@ -509,6 +509,10 @@ async function createExpertReport(){
     const txt=await r.text(),blob=new Blob([txt],{type:"text/html"}),url=URL.createObjectURL(blob);
     window.open(url,"_blank");setTimeout(()=>URL.revokeObjectURL(url),60000);
   }catch(e){$("status").innerHTML=`<span class="bad">${e.message}</span>`}
+}
+async function logout(){
+  try { await fetch("/api/logout",{method:"POST"}); }
+  finally { window.location.replace("/login"); }
 }
 refreshDVFStatus();
 clearResults();

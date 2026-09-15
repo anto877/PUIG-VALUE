@@ -9,13 +9,17 @@ import os
 import sqlite3
 import asyncio
 import html
+import secrets
+import hashlib
+import hmac
+import time
 from datetime import date, datetime
 from pathlib import Path
 from typing import Any
 
 import httpx
-from fastapi import FastAPI, HTTPException, Query
-from fastapi.responses import FileResponse, HTMLResponse
+from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi.responses import FileResponse, HTMLResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -30,7 +34,211 @@ DVF_BASE = "https://files.data.gouv.fr/geo-dvf/latest/csv"
 DVF_CACHE_MAX_AGE_DAYS = int(os.getenv("DVF_CACHE_MAX_AGE_DAYS", "7"))
 DVF_SYNC_INTERVAL_HOURS = int(os.getenv("DVF_SYNC_INTERVAL_HOURS", "24"))
 
-app = FastAPI(title="PUIG VALUE", version="1.0.0")
+app = FastAPI(title="PUIG VALUE WEB", version="2.4.0")
+
+# ============================================================
+# PUIG VALUE V2.4 - AUTHENTIFICATION PRIVEE
+# Les identifiants sont définis exclusivement dans Render.
+# ============================================================
+PUIG_ADMIN_USER = os.getenv("PUIG_ADMIN_USER", "").strip()
+PUIG_ADMIN_PASSWORD = os.getenv("PUIG_ADMIN_PASSWORD", "")
+PUIG_SESSION_SECRET = os.getenv("PUIG_SESSION_SECRET", "").strip()
+SESSION_COOKIE = "puig_value_session"
+SESSION_MAX_AGE = 60 * 60 * 12  # 12 heures
+
+def auth_configured() -> bool:
+    return bool(PUIG_ADMIN_USER and PUIG_ADMIN_PASSWORD and PUIG_SESSION_SECRET)
+
+def make_session_token(username: str, expires: int) -> str:
+    message = f"{username}|{expires}".encode("utf-8")
+    signature = hmac.new(
+        PUIG_SESSION_SECRET.encode("utf-8"),
+        message,
+        hashlib.sha256
+    ).hexdigest()
+    return f"{username}|{expires}|{signature}"
+
+def valid_session(token: str | None) -> bool:
+    if not auth_configured() or not token:
+        return False
+    try:
+        username, expires_text, signature = token.rsplit("|", 2)
+        expires = int(expires_text)
+        if expires < int(time.time()):
+            return False
+        if not secrets.compare_digest(username, PUIG_ADMIN_USER):
+            return False
+        expected = hmac.new(
+            PUIG_SESSION_SECRET.encode("utf-8"),
+            f"{username}|{expires}".encode("utf-8"),
+            hashlib.sha256
+        ).hexdigest()
+        return hmac.compare_digest(signature, expected)
+    except Exception:
+        return False
+
+PUBLIC_PATHS = {"/login", "/api/login", "/api/health"}
+
+@app.middleware("http")
+async def authentication_middleware(request: Request, call_next):
+    path = request.url.path
+    if path in PUBLIC_PATHS:
+        return await call_next(request)
+
+    if valid_session(request.cookies.get(SESSION_COOKIE)):
+        return await call_next(request)
+
+    if path.startswith("/api/"):
+        return JSONResponse(
+            status_code=401,
+            content={"detail": "Authentification requise"}
+        )
+    return RedirectResponse(url="/login", status_code=303)
+
+@app.get("/login", response_class=HTMLResponse)
+def login_page(request: Request):
+    if valid_session(request.cookies.get(SESSION_COOKIE)):
+        return RedirectResponse(url="/", status_code=303)
+
+    config_warning = "" if auth_configured() else """
+    <div class="warning">
+      La protection n'est pas encore configurée. Ajoutez les trois variables
+      PUIG_ADMIN_USER, PUIG_ADMIN_PASSWORD et PUIG_SESSION_SECRET dans Render.
+    </div>
+    """
+
+    return HTMLResponse(f"""<!doctype html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<meta name="robots" content="noindex,nofollow">
+<title>Connexion · PUIG VALUE™</title>
+<style>
+*{{box-sizing:border-box}}
+body{{margin:0;background:#090e14;color:#f8fafc;font-family:Arial,sans-serif;
+min-height:100vh;display:grid;place-items:center;padding:20px}}
+.card{{width:min(430px,100%);background:#151b24;border:1px solid #2d3748;
+border-radius:18px;padding:30px;box-shadow:0 20px 70px rgba(0,0,0,.35)}}
+.brand{{display:flex;gap:14px;align-items:center;margin-bottom:26px}}
+.logo{{background:#ed0a72;border-radius:12px;width:50px;height:50px;
+display:grid;place-items:center;font-weight:900;font-size:18px}}
+h1{{font-size:23px;margin:0}}
+.sub{{color:#9ca3af;font-size:13px;margin-top:4px}}
+label{{display:block;color:#aeb7c4;font-size:12px;margin:16px 0 6px}}
+input{{width:100%;padding:13px;border-radius:10px;border:1px solid #344050;
+background:#0d131b;color:white;font-size:16px;outline:none}}
+input:focus{{border-color:#ed0a72}}
+button{{width:100%;margin-top:22px;padding:14px;border:0;border-radius:11px;
+background:#ed0a72;color:white;font-weight:800;font-size:16px;cursor:pointer}}
+.error{{color:#ff8d8d;font-size:13px;min-height:18px;margin-top:12px}}
+.warning{{background:#3a2418;border:1px solid #7c4a22;padding:11px;border-radius:9px;
+font-size:12px;line-height:1.45;margin-bottom:16px}}
+.secure{{text-align:center;color:#687386;font-size:11px;margin-top:18px}}
+</style>
+</head>
+<body>
+<div class="card">
+  <div class="brand">
+    <div class="logo">PV</div>
+    <div><h1>PUIG VALUE™</h1><div class="sub">Accès privé · PUIG EXPERTISES</div></div>
+  </div>
+  {config_warning}
+  <form id="loginForm">
+    <label>Identifiant</label>
+    <input id="username" autocomplete="username" required autofocus>
+    <label>Mot de passe</label>
+    <input id="password" type="password" autocomplete="current-password" required>
+    <button type="submit">Se connecter</button>
+    <div id="error" class="error"></div>
+  </form>
+  <div class="secure">Session privée sécurisée · expiration après 12 heures</div>
+</div>
+<script>
+document.getElementById("loginForm").addEventListener("submit", async (event) => {{
+  event.preventDefault();
+  const error = document.getElementById("error");
+  error.textContent = "";
+  try {{
+    const response = await fetch("/api/login", {{
+      method: "POST",
+      headers: {{"Content-Type":"application/json"}},
+      body: JSON.stringify({{
+        username: document.getElementById("username").value,
+        password: document.getElementById("password").value
+      }})
+    }});
+    if (response.ok) {{
+      window.location.replace("/");
+      return;
+    }}
+    const data = await response.json().catch(() => ({{}}));
+    error.textContent = data.detail || "Identifiant ou mot de passe incorrect.";
+  }} catch (_) {{
+    error.textContent = "Connexion au serveur impossible.";
+  }}
+}});
+</script>
+</body>
+</html>""")
+
+@app.post("/api/login")
+async def login(request: Request):
+    if not auth_configured():
+        raise HTTPException(
+            status_code=503,
+            detail="Authentification non configurée sur Render."
+        )
+
+    try:
+        data = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Requête invalide.")
+
+    username = str(data.get("username", ""))
+    password = str(data.get("password", ""))
+
+    user_ok = secrets.compare_digest(username, PUIG_ADMIN_USER)
+    password_ok = secrets.compare_digest(password, PUIG_ADMIN_PASSWORD)
+
+    if not (user_ok and password_ok):
+        raise HTTPException(
+            status_code=401,
+            detail="Identifiant ou mot de passe incorrect."
+        )
+
+    expires = int(time.time()) + SESSION_MAX_AGE
+    response = JSONResponse({"ok": True})
+    response.set_cookie(
+        key=SESSION_COOKIE,
+        value=make_session_token(PUIG_ADMIN_USER, expires),
+        max_age=SESSION_MAX_AGE,
+        httponly=True,
+        secure=True,
+        samesite="lax",
+        path="/"
+    )
+    return response
+
+@app.post("/api/logout")
+def logout():
+    response = JSONResponse({"ok": True})
+    response.delete_cookie(
+        key=SESSION_COOKIE,
+        path="/",
+        secure=True,
+        httponly=True,
+        samesite="lax"
+    )
+    return response
+
+@app.get("/api/auth")
+def auth_status(request: Request):
+    return {
+        "authenticated": valid_session(request.cookies.get(SESSION_COOKIE)),
+        "username": PUIG_ADMIN_USER
+    }
+
 app.mount("/static", StaticFiles(directory=BASE_DIR / "app" / "static"), name="static")
 
 
