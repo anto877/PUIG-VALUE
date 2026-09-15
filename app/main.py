@@ -35,7 +35,7 @@ DVF_BASE = "https://files.data.gouv.fr/geo-dvf/latest/csv"
 DVF_CACHE_MAX_AGE_DAYS = int(os.getenv("DVF_CACHE_MAX_AGE_DAYS", "7"))
 DVF_SYNC_INTERVAL_HOURS = int(os.getenv("DVF_SYNC_INTERVAL_HOURS", "24"))
 
-app = FastAPI(title="PUIG VALUE WEB", version="2.5.0")
+app = FastAPI(title="PUIG VALUE WEB", version="2.6.0")
 
 # ============================================================
 # PUIG VALUE V2.4 - AUTHENTIFICATION PRIVEE
@@ -790,7 +790,7 @@ async def estimate(req: EstimateRequest):
                 tiers.append((label, [c for c in candidates if c["distance"] <= rr]))
             selection_method = "Appartement : aucune vente à la même adresse, élargissement progressif"
             for label, tier in tiers:
-                for c in sorted(tier, key=lambda x: x["score"], reverse=True):
+                for c in sorted(tier, key=lambda x: (str(x.get("date") or x.get("date_mutation") or ""), x.get("score", 0)), reverse=True):
                     if c["score"] < 60 or c["id_mutation"] in seen:
                         continue
                     seen.add(c["id_mutation"]); selected.append(c)
@@ -812,7 +812,7 @@ async def estimate(req: EstimateRequest):
         ]
         selection_method = "Maison : élargissement progressif"
         for label, tier in tiers:
-            for c in sorted(tier, key=lambda x: x["score"], reverse=True):
+            for c in sorted(tier, key=lambda x: (str(x.get("date") or x.get("date_mutation") or ""), x.get("score", 0)), reverse=True):
                 if c["score"] < 60 or c["id_mutation"] in seen:
                     continue
                 seen.add(c["id_mutation"]); selected.append(c)
@@ -825,6 +825,19 @@ async def estimate(req: EstimateRequest):
 
     # Nombre maximal de références conservées après la recherche progressive.
     target_n = 10 if req.property_type == "Appartement" else 12
+
+    # V2.6 — priorité chronologique DVF :
+    # parmi les références admissibles trouvées par la recherche progressive,
+    # on conserve/affiche les mutations de la plus récente à la plus ancienne.
+    # À date identique, le score de comparabilité départage les références.
+    selected = sorted(
+        selected,
+        key=lambda c: (
+            str(c.get("date") or c.get("date_mutation") or ""),
+            float(c.get("score", 0) or 0)
+        ),
+        reverse=True
+    )
     selected = selected[:target_n]
     expanded_radius = round(effective_radius or req.radius_m)
 
