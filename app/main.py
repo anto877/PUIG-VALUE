@@ -35,7 +35,7 @@ DVF_BASE = "https://files.data.gouv.fr/geo-dvf/latest/csv"
 DVF_CACHE_MAX_AGE_DAYS = int(os.getenv("DVF_CACHE_MAX_AGE_DAYS", "7"))
 DVF_SYNC_INTERVAL_HOURS = int(os.getenv("DVF_SYNC_INTERVAL_HOURS", "24"))
 
-app = FastAPI(title="PUIG VALUE WEB", version="2.7.0")
+app = FastAPI(title="PUIG VALUE WEB", version="2.8.0")
 
 # ============================================================
 # PUIG VALUE V2.4 - AUTHENTIFICATION PRIVEE
@@ -247,7 +247,7 @@ class EstimateRequest(BaseModel):
     condition: int = Field(default=7, ge=1, le=10)
     dpe: str = Field(default="D", pattern="^[A-G]$")
     radius_m: int = Field(default=1000, ge=100, le=5000)
-    surface_tolerance: float = Field(default=0.25, ge=0.05, le=0.75)
+    surface_tolerance: float = Field(default=0.20, ge=0.05, le=0.75)
     pressure: int = Field(default=50, ge=0, le=100)
     expert_value: float | None = Field(default=None, gt=0)
     garage: bool = False
@@ -609,14 +609,15 @@ def street_only(s: str) -> str:
     return re.sub(r"^\\d+[a-z]?\\s+", "", s).strip()
 
 
-DPE_ADJ = {"A": 0.05, "B": 0.03, "C": 0.015, "D": 0.0, "E": -0.02, "F": -0.05, "G": -0.08}
+DPE_ADJ = {"A": 0.0, "B": 0.0, "C": 0.0, "D": 0.0, "E": 0.0, "F": 0.0, "G": 0.0}
 
 
 def subject_quality_adjustment(req: EstimateRequest) -> dict[str, float]:
     # Coefficients V1.2 explicités et volontairement plafonnés.
     # Ils sont à recalibrer ultérieurement par apprentissage sur ventes réelles.
     condition = max(-0.125, min(0.075, (req.condition - 7) * 0.025))
-    dpe = DPE_ADJ.get(req.dpe, 0.0)
+    # EVS 2025 : le DPE est documenté et analysé, mais aucune correction automatique n’est appliquée.
+    dpe = 0.0
     garage = 0.025 if req.garage else 0.0
     micro = max(-0.06, min(0.06, (req.micro_location - 7) * 0.02))
     architecture = max(-0.045, min(0.045, (req.architecture - 7) * 0.015))
@@ -892,8 +893,35 @@ async def estimate(req: EstimateRequest):
     if len(selected) < 5: alerts.append("Moins de 5 comparables significatifs.")
     if cv > .18: alerts.append("Dispersion élevée des prix au m².")
     if med_dist and med_dist > 1200: alerts.append("Comparables géographiquement éloignés.")
-    if med_age and med_age > 36: alerts.append("Références relativement anciennes.")
+    if med_age and med_age > 36: alerts.append("Références relativement anciennes : vérifier une correction d'évolution du marché avant conclusion.")
+    if sum(1 for c in selected if int(c.get("months", 9999)) <= 24) < 3:
+        alerts.append("Peu de références N/N-1 : l'élargissement temporel doit être justifié dans le rapport.")
     if not req.expert_value: alerts.append("Valeur non encore validée par l'expert après visite.")
+
+    # PUIG VALUE V2.8 — contrôle de cohérence inspiré du support EVS 2025.
+    # Il rend le raisonnement visible sans prétendre remplacer le jugement de l'expert.
+    ppm_values = [float(c["price_per_m2"]) for c in selected if c.get("price_per_m2")]
+    ppm_min = min(ppm_values) if ppm_values else 0
+    ppm_max = max(ppm_values) if ppm_values else 0
+    global_values = [float(c["price"]) for c in selected if c.get("price")]
+    global_min = min(global_values) if global_values else 0
+    global_max = max(global_values) if global_values else 0
+    recent_count = sum(1 for c in selected if int(c.get("months", 9999)) <= 24)
+    evs_checks = {
+        "framework": "Approche → Méthode → Modèle → Jugement",
+        "approach": "Marché",
+        "method": "Comparaison directe pondérée",
+        "model": "Score de pertinence + ajustements explicites + contrôle statistique",
+        "expert_judgment": "Validation finale requise",
+        "surface_rule": "Comparables proches de ±20 % par défaut ; élargissement seulement si justifié",
+        "time_rule": "Priorité N/N-1 ; références plus anciennes possibles si le marché l'exige",
+        "dpe_rule": "DPE analysé sans correction automatique",
+        "offer_rule": "Prix d'offre = indice de marché / recoupement, jamais transaction assimilée",
+        "recent_24m_count": recent_count,
+        "ppm_bracket": {"low": round(ppm_min), "high": round(ppm_max)},
+        "global_value_bracket": {"low": round(global_min), "high": round(global_max)},
+        "black_box_check": "Critères, références, scores, poids et ajustements affichés",
+    }
 
     result = {
         "geocode": geo,
@@ -940,6 +968,7 @@ async def estimate(req: EstimateRequest):
             "sensitivity": sensitivity,
         },
         "alerts": alerts,
+        "evs2025": evs_checks,
         "comparables": selected,
     }
 
@@ -1147,7 +1176,8 @@ table{{width:100%;border-collapse:collapse;font-size:9pt}} th,td{{border-bottom:
 <tr><td>{_esc(p.get("property_type",""))}</td><td>{_esc(p.get("surface",""))} m²</td><td>{_esc(p.get("land",0))} m²</td><td>{_esc(p.get("rooms",0))}</td><td>{_esc(p.get("condition",""))}/10</td><td>{_esc(p.get("dpe",""))}</td></tr></table>
 
 <h2>4. Méthodologie comparative</h2>
-<p>Pour les appartements, la priorité est donnée au même immeuble puis à la même rue. Pour les maisons, la priorité est donnée aux références situées dans un rayon proche de 300 m, avant élargissement progressif si nécessaire. Chaque mutation reçoit un score de pertinence et un poids non linéaire.</p>
+<p>La sélection suit un processus explicite : aire de marché pertinente, type de bien, proximité de surface, proximité temporelle et pertinence. Pour les appartements, la priorité est donnée à la même adresse ; pour les maisons, la recherche part de 100 m et s'élargit progressivement. Les mutations sont présentées de la plus récente à la plus ancienne. Chaque référence reçoit un score de pertinence et un poids non linéaire.</p>
+<p>Règle de gabarit par défaut : références proches de ±20 % de la surface du bien, sauf élargissement justifié par les données disponibles.</p>
 <p>Valeur issue des comparables : <strong>{_euro(v.get("comparables_value"))}</strong>. Après correction des caractéristiques : <strong>{_euro(v.get("quality_adjusted_value"))}</strong>.</p>
 <p>{_esc(qualitative)} Ajustement total : <strong>{_esc(q.get("total",0))}%</strong>.</p>
 
@@ -1162,16 +1192,20 @@ table{{width:100%;border-collapse:collapse;font-size:9pt}} th,td{{border-bottom:
 {distance_svg}
 <p>Pente distance : <strong>{_esc(round(dist_reg.get("slope",0),2))}</strong> €/m² par mètre · R² : <strong>{_esc(round(dist_reg.get("r2",0),2))}</strong>.</p>
 
-<h2>7. Incidence du DPE et de l’état</h2>
-<p>DPE retenu : <strong>{_esc(p.get("dpe",""))}</strong>. État retenu : <strong>{_esc(p.get("condition",""))}/10</strong>. Les corrections qualitatives prennent aussi en compte le stationnement, la micro-localisation, l’architecture et les nuisances.</p>
+<h2>7. DPE, état et caractéristiques qualitatives</h2>
+<p>DPE retenu : <strong>{_esc(p.get("dpe",""))}</strong>. Conformément au principe retenu dans le support EVS 2025, aucune correction automatique de valeur n'est appliquée au seul classement DPE. Son incidence doit être démontrée par le marché et appréciée par l'expert. État retenu : <strong>{_esc(p.get("condition",""))}/10</strong>. Les autres corrections qualitatives sont explicitées séparément.</p>
 
-<h2>8. Synthèse et conclusion de valeur</h2>
+<h2>8. Contrôle de cohérence EVS 2025</h2>
+<p>Architecture du raisonnement : <strong>Approche → Méthode → Modèle → Jugement</strong>. L'approche principale retenue pour ce bien résidentiel est l'approche par le marché, mise en œuvre par comparaison directe pondérée. Les prix d'offre, lorsqu'ils seront intégrés au moteur de marché actif, ne devront servir que de repère ou de recoupement et devront être retraités.</p>
+<p>Le contrôle final doit vérifier la cohérence entre la fourchette de prix au m², la valeur globale du segment, la qualité des comparables et les constatations de visite. Le recours à une autre méthode ne se justifie que si elle apporte une information pertinente et documentée.</p>
+
+<h2>9. Synthèse et conclusion de valeur</h2>
 <div class="callout"><strong>Valeur vénale centrale : {_euro(v.get("central"))}</strong><br>
 Fourchette : {_euro(v.get("low"))} à {_euro(v.get("high"))}<br>
 Prix de commercialisation indicatif : {_euro(v.get("listing"))}<br>
 Scénario de vente rapide : {_euro(v.get("quick_sale"))}</div>
 
-<h2>9. Sources et réserves</h2>
+<h2>10. Sources et réserves</h2>
 <p>Sources principales : DVF géolocalisé, géocodage IGN/Géoplateforme, données territoriales publiques et informations saisies lors de l’expertise. La conclusion doit être rapprochée des constatations de visite et des documents juridiques, techniques et urbanistiques.</p>
 <p class="muted">Rapport généré uniquement à la demande depuis PUIG VALUE™.</p>
 <button onclick="window.print()">Imprimer / enregistrer en PDF</button>

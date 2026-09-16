@@ -166,7 +166,7 @@ tr.excluded{opacity:.38;text-decoration:line-through}
 <option value="1500">1,5 km</option>
 <option value="2000">2 km</option>
 </select><div class="mini" style="margin-top:4px">Le moteur commence toujours à 100 m, puis 200 → 300 → 400 → 500 m. La valeur choisie ici est uniquement le plafond autorisé.</div></div>
-<div><label>Tolérance surface</label><select id="surface_tolerance"><option value=".15">±15 %</option><option value=".25" selected>±25 %</option><option value=".35">±35 %</option><option value=".50">±50 %</option></select></div>
+<div><label>Tolérance surface</label><select id="surface_tolerance"><option value=".15">±15 %</option><option value=".20" selected>±20 % (règle EVS)</option><option value=".25">±25 %</option><option value=".35">±35 %</option><option value=".50">±50 %</option></select></div>
 <div><label>Pression marché (0–100)</label><input id="pressure" type="number" placeholder="0 à 100" min="0" max="100"></div>
 <div><label>Avis expert (€) — optionnel</label><input id="expert_value" type="number" placeholder="Ex. 310000"></div>
 <div><label>Garage / stationnement</label><select id="garage"><option value="false">Non</option><option value="true">Oui</option></select></div>
@@ -209,7 +209,7 @@ tr.excluded{opacity:.38;text-decoration:line-through}
 <div class="row" style="justify-content:space-between"><span id="confLabel" class="badge">—</span><b id="confText">—</b></div>
 <div class="progress" style="margin-top:8px"><div id="confBar" style="width:0"></div></div><div id="breakdown"></div>
 <div class="section">Analyse du marché</div><div id="analysis" class="mini">—</div>
-<div class="section">Impact des critères du bien</div><div id="qualityImpact" class="mini">—</div>
+<div class="section">Impact des critères du bien</div><div id="qualityImpact" class="mini">—</div><div class="section">Contrôle EVS 2025</div><div id="evsAudit" class="mini">—</div>
 <div class="section">Top comparables</div><div id="top"></div>
 <div class="section">Contrôle contradictoire</div><div id="alerts" class="mini">—</div>
 <div class="section">Estimations sauvegardées</div><div id="history" class="mini">Aucune estimation chargée.</div>
@@ -309,7 +309,7 @@ function clearResults(){
   ["central","low","high","listing","quick","ambitious"].forEach(id=>$(id).textContent="—");
   $("confText").textContent="—"; $("confBar").style.width="0"; $("confLabel").textContent="—";
   $("analysis").textContent="—"; $("qualityImpact").textContent="—"; $("top").innerHTML="";
-  $("alerts").textContent="—"; $("breakdown").innerHTML="";
+  $("alerts").textContent="—"; $("breakdown").innerHTML=""; if($("evsAudit")) $("evsAudit").textContent="—";
   $("tbody").innerHTML='<tr><td colspan="11"><div class="empty-state">Aucune référence sélectionnée. Lancez une analyse pour afficher les comparables DVF.</div></td></tr>';
   if(mapObj){mapObj.remove();mapObj=null;}
   Object.keys(charts).forEach(k=>destroyChart(k));
@@ -371,7 +371,7 @@ function recalcFromSelection(){
 
   $("central").textContent=money(v.central);$("low").textContent=money(v.low);$("high").textContent=money(v.high);
   $("listing").textContent=money(v.listing);$("quick").textContent=money(v.quick_sale);$("ambitious").textContent=money(v.ambitious);
-  $("qualityImpact").innerHTML=`Base comparables sélectionnés : <b>${money(v.comparables_value)}</b><br>Après critères du bien : <b>${money(v.quality_adjusted_value)}</b><br>État : <b>${q.condition||0}%</b> · DPE : <b>${q.dpe||0}%</b> · Garage : <b>${q.garage||0}%</b> · Micro-localisation : <b>${q.micro_location||0}%</b> · Architecture : <b>${q.architecture||0}%</b> · Nuisances : <b>${q.nuisance||0}%</b><br>Ajustement total : <b>${q.total||0}%</b>.`;
+  $("qualityImpact").innerHTML=`Base comparables sélectionnés : <b>${money(v.comparables_value)}</b><br>Après critères du bien : <b>${money(v.quality_adjusted_value)}</b><br>État : <b>${q.condition||0}%</b> · DPE : <b>analysé, sans correction automatique</b> · Garage : <b>${q.garage||0}%</b> · Micro-localisation : <b>${q.micro_location||0}%</b> · Architecture : <b>${q.architecture||0}%</b> · Nuisances : <b>${q.nuisance||0}%</b><br>Ajustement total : <b>${q.total||0}%</b>.`;
   $("selectionNote").innerHTML=`<b>${comps.length}</b> référence(s) utilisée(s) sur ${currentResult.comparables.length}. Décochez une vente pour l’exclure : la valeur, la carte et les régressions sont recalculées immédiatement.`;
   // Refresh rows/top/map/charts without losing current exclusions
   $("tbody").innerHTML=currentResult.comparables.map((x,i)=>`<tr class="${excludedComparableIds.has(String(x.id_mutation))?'excluded':''}"><td><input type="checkbox" class="comp-toggle" ${excludedComparableIds.has(String(x.id_mutation))?'':'checked'} onchange="toggleComparable('${x.id_mutation}')"></td><td>${x.address||x.parcel}</td><td>${x.date}</td><td>${money(x.price)}</td><td>${ppm(x.price_per_m2)}</td><td>${x.surface}</td><td>${x.land||"—"}</td><td>${x.rooms||"—"}</td><td>${Math.round(x.distance)} m</td><td><b>${x.score}</b></td><td>${money(x.adjusted_value)}</td></tr>`).join("");
@@ -441,8 +441,10 @@ function render(d){
  $("confText").textContent=Math.round(c.score)+"/100";$("confBar").style.width=c.score+"%";$("confLabel").textContent=c.score>=85?"Confiance élevée":c.score>=70?"Confiance correcte":"Confiance prudente";
  $("breakdown").innerHTML=Object.entries(c.parts).map(([n,x])=>{let max={"Qualité comparables":30,"Nombre de comparables":15,"Fraîcheur":10,"Dispersion":15,"Données du bien":10,"Micro-localisation":5,"Marché actif":5,"Validation expert":5,"Absence d'anomalies":5}[n]||10;return `<div class="metric"><span>${n}</span><div class="bar"><div style="width:${Math.min(100,x/max*100)}%"></div></div><span>${Math.round(x)}/${max}</span></div>`}).join("");
  $("analysis").innerHTML=`Adresse reconnue : <b>${d.geocode.label}</b><br>Commune : <b>${d.geocode.city}</b> (${d.source.citycode})<br>Transactions résidentielles simples analysées : <b>${d.source.sales_scanned}</b><br>Méthode : <b>${d.search.selection_method}</b><br>Rayon effectif : <b>${d.search.effective_radius_m} m</b><br>Prix/m² médian : <b>${ppm(m.median_price_per_m2)}</b><br>Distance médiane : <b>${m.median_distance_m} m</b>.`;
+ const ev=d.evs2025||{};
+ $("evsAudit").innerHTML=`<b>${ev.framework||"Approche → Méthode → Modèle → Jugement"}</b><br>Approche : <b>${ev.approach||"Marché"}</b><br>Méthode : <b>${ev.method||"Comparaison directe"}</b><br>Références ≤ 24 mois : <b>${ev.recent_24m_count??"—"}</b><br>Surface : <b>${ev.surface_rule||"±20 % par défaut"}</b><br>DPE : <b>${ev.dpe_rule||"sans correction automatique"}</b><br>Boîte noire : <b>${ev.black_box_check||"processus explicité"}</b>.`;
  const q=v.quality_adjustment||{};
- $("qualityImpact").innerHTML=`Base comparables : <b>${money(v.comparables_value)}</b><br>Après critères du bien : <b>${money(v.quality_adjusted_value)}</b><br>État : <b>${q.condition||0}%</b> · DPE : <b>${q.dpe||0}%</b> · Garage : <b>${q.garage||0}%</b> · Micro-localisation : <b>${q.micro_location||0}%</b> · Architecture : <b>${q.architecture||0}%</b> · Nuisances : <b>${q.nuisance||0}%</b><br>Ajustement total : <b>${q.total||0}%</b>.`;
+ $("qualityImpact").innerHTML=`Base comparables : <b>${money(v.comparables_value)}</b><br>Après critères du bien : <b>${money(v.quality_adjusted_value)}</b><br>État : <b>${q.condition||0}%</b> · DPE : <b>analysé, sans correction automatique</b> · Garage : <b>${q.garage||0}%</b> · Micro-localisation : <b>${q.micro_location||0}%</b> · Architecture : <b>${q.architecture||0}%</b> · Nuisances : <b>${q.nuisance||0}%</b><br>Ajustement total : <b>${q.total||0}%</b>.`;
  $("tbody").innerHTML=d.comparables.map((x,i)=>`<tr data-comp="${i}" class="${excludedComparableIds.has(String(x.id_mutation))?'excluded':''}">
 <td><input type="checkbox" class="comp-toggle" ${excludedComparableIds.has(String(x.id_mutation))?'':'checked'} onchange="toggleComparable('${x.id_mutation}')"></td>
 <td>${x.address||x.parcel}</td><td>${x.date}</td><td>${money(x.price)}</td><td>${ppm(x.price_per_m2)}</td><td>${x.surface}</td><td>${x.land||"—"}</td><td>${x.rooms||"—"}</td><td>${Math.round(x.distance)} m</td><td><b>${x.score}</b></td><td>${money(x.adjusted_value)}</td></tr>`).join("");
