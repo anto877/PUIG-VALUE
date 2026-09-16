@@ -35,7 +35,7 @@ DVF_BASE = "https://files.data.gouv.fr/geo-dvf/latest/csv"
 DVF_CACHE_MAX_AGE_DAYS = int(os.getenv("DVF_CACHE_MAX_AGE_DAYS", "7"))
 DVF_SYNC_INTERVAL_HOURS = int(os.getenv("DVF_SYNC_INTERVAL_HOURS", "24"))
 
-app = FastAPI(title="PUIG VALUE WEB", version="2.6.0")
+app = FastAPI(title="PUIG VALUE WEB", version="2.7.0")
 
 # ============================================================
 # PUIG VALUE V2.4 - AUTHENTIFICATION PRIVEE

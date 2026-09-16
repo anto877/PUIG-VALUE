@@ -132,11 +132,11 @@ tr.excluded{opacity:.38;text-decoration:line-through}
 <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
 <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
 <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.7/dist/chart.umd.min.js"></script>
-</head>
-<body>
+<style>@media(max-width:600px){#pvChoice{grid-template-columns:1fr!important}#pvChoice button{min-height:140px!important}}</style></head>
+<body><div id="startMenu" style="position:fixed;inset:0;z-index:99999;background:#090e14;display:flex;align-items:center;justify-content:center;padding:22px"><div style="width:min(760px,100%);text-align:center"><div style="font-size:13px;color:#9ca3af;letter-spacing:.08em;margin-bottom:8px">PUIG EXPERTISES</div><h1 style="margin:0 0 8px;font-size:42px">PUIG VALUE™</h1><div style="color:#9ca3af;margin-bottom:34px">Quelle estimation souhaitez-vous réaliser ?</div><div id="pvChoice" style="display:grid;grid-template-columns:1fr 1fr;gap:18px;max-width:600px;margin:auto"><button onclick="startNewEstimate('Maison')" style="min-height:190px;border:1px solid #344050;border-radius:22px;background:#151b24;color:white;cursor:pointer;padding:24px;font:inherit"><div style="font-size:64px">🏠</div><div style="font-size:24px;font-weight:800;margin-top:12px">Maison</div></button><button onclick="startNewEstimate('Appartement')" style="min-height:190px;border:1px solid #344050;border-radius:22px;background:#151b24;color:white;cursor:pointer;padding:24px;font:inherit"><div style="font-size:64px">🏢</div><div style="font-size:24px;font-weight:800;margin-top:12px">Appartement</div></button></div><div style="margin-top:26px;color:#667085;font-size:12px">Bientôt : locaux commerciaux · immeubles de rapport · terrains</div></div></div>
 <header><div class="wrap top">
 <div class="brand"><div class="logo">PV</div><div><h1>PUIG VALUE™ WEB</h1><div class="sub">DVF réel · Géocodage IGN · historique des estimations</div></div></div>
-<div class="row no-print header-actions"><button class="ghost" onclick="syncDVF()">Synchroniser DVF</button><button class="ghost" onclick="loadSavedHistory()">Estimations sauvegardées</button><button class="ghost" onclick="window.print()">PDF écran</button><button id="usersBtn" class="ghost" style="display:none" onclick="location.href='/admin/users'">Utilisateurs</button><button class="ghost" onclick="logout()">Déconnexion</button></div>
+<div class="row no-print header-actions"><button class="ghost" onclick="syncDVF()">Synchroniser DVF</button><button class="ghost" onclick="loadSavedHistory()">Estimations sauvegardées</button><button class="ghost" onclick="window.print()">PDF écran</button><button id="usersBtn" class="ghost" style="display:none" onclick="location.href='/admin/users'">Utilisateurs</button><button class="ghost" onclick="showStartMenu()">＋ Nouvelle estimation</button><button class="ghost" onclick="logout()">Déconnexion</button></div>
 </div></header>
 <main class="wrap"><div id="dvfSyncStatus" class="mini" style="padding:8px 2px 10px">DVF : vérification de la synchronisation…</div><div class="layout">
 <section class="card">
@@ -523,5 +523,9 @@ async function loadIdentity(){
 loadIdentity();
 refreshDVFStatus();
 clearResults();
+function pvType(t){let s=[...document.querySelectorAll("select")].find(x=>[...x.options].some(o=>o.value===t));if(s){s.value=t;s.dispatchEvent(new Event("change",{bubbles:true}))}}
+function resetEstimate(){if(typeof currentResult!=="undefined")currentResult=null;if(typeof excludedComparableIds!=="undefined"&&excludedComparableIds.clear)excludedComparableIds.clear();let f=document.querySelector("form");if(f)f.reset();document.querySelectorAll('input[type="text"],input[type="number"],textarea').forEach(e=>e.value="");if(typeof clearResults==="function")clearResults();window.scrollTo(0,0)}
+function showStartMenu(){resetEstimate();document.getElementById("startMenu").style.display="flex"}
+function startNewEstimate(t){resetEstimate();pvType(t);document.getElementById("startMenu").style.display="none";window.scrollTo(0,0)}
 </script>
 </body></html>

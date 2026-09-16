@@ -1,0 +1,1 @@
+PUIG VALUE V2.7 : accueil Maison/Appartement, bouton Nouvelle estimation avec remise à zéro, préparation des futures catégories commerciaux/immeubles/terrains. Moteur V2.6 et multi-utilisateurs conservés.
