@@ -318,12 +318,12 @@ def _pro_rows(paths: list[Path], property_type: str) -> list[dict[str, Any]]:
         if not price or not lat or not lon or price < 5000 or price > 100_000_000: continue
         locals_seen=set(); res_surface=0.; commercial_surface=0.; res_units=0; commercial_units=0
         for r in rows:
-            local_id=(r.get('id_local') or r.get('id_parcelle') or '', r.get('type_local') or '', r.get('surface_reelle_bati') or '')
+            local_id=(r.get('id_local') or '', r.get('id_parcelle') or '', r.get('lot1_numero') or '', r.get('adresse_numero') or '', r.get('type_local') or '', r.get('surface_reelle_bati') or '')
             if local_id in locals_seen: continue
             locals_seen.add(local_id)
             typ=r.get('type_local') or ''; surf=fnum(r.get('surface_reelle_bati'))
             if typ in {'Maison','Appartement'} and surf>0: res_surface+=surf; res_units+=1
-            if typ == 'Local industriel. commercial ou assimilé' and surf>0: commercial_surface+=surf; commercial_units+=1
+            if (('commercial' in typ.lower()) or ('industriel' in typ.lower())) and surf>0: commercial_surface+=surf; commercial_units+=1
         land=max([fnum(r.get('surface_terrain')) for r in rows] or [0])
         addr=' '.join(x for x in [r0.get('adresse_numero') or '',r0.get('adresse_suffixe') or '',r0.get('adresse_nom_voie') or ''] if x).strip()
         if property_type=='Local commercial':
@@ -370,21 +370,31 @@ async def _pro_market_analysis(req: ProEstimateRequest) -> dict[str, Any]:
     for sale in sales:
         if sale.get('id_mutation') in excluded: continue
         d=haversine(geo['lat'],geo['lon'],sale['lat'],sale['lon'])
-        if d>req.radius_m: continue
-        ratio=sale['surface']/req.surface if req.surface else 0
-        # Tolérance de gabarit progressive : on garde les candidats plus larges mais leur score les pénalise.
-        if ratio < max(.25,1-req.surface_tolerance*2) or ratio > 1+req.surface_tolerance*2: continue
+        # Le marché PRO est plus rare que le résidentiel : on constitue d'abord un univers large,
+        # puis on hiérarchise par distance/gabarit/récence au lieu d'éliminer trop tôt.
+        max_search = max(req.radius_m, 10000 if req.property_type=='Local commercial' else 15000)
+        if d>max_search: continue
         sc=_pro_comp_score(req,sale,d)
         cand.append({**sale,'distance':round(d,1),'months':age_months(sale['date']),'score':round(sc,1),'price_per_m2':round(sale['price_per_m2'],0)})
-    # EVS : d'abord segment/gabarit et pertinence, avec priorité aux mutations récentes.
     cand.sort(key=lambda c:(str(c['date']),c['score']),reverse=True)
-    selected=[]
-    for radius in [250,500,750,1000,1500,2000,3000,5000,10000]:
-        if radius>req.radius_m: break
-        pool=[c for c in cand if c['distance']<=radius and c['score']>=55]
-        if len(pool)>=4 or radius==req.radius_m:
-            selected=pool[:12]; break
-    if not selected: selected=[c for c in cand if c['score']>=45][:10]
+    selected=[]; selection_stage=''
+    # 1) périmètre demandé + gabarit proche ; 2) périmètre demandé sans filtre dur de gabarit ;
+    # 3) élargissement PRO jusqu'à 10/15 km. Ainsi une recherche ne revient pas vide alors que des ventes existent.
+    stages=[]
+    for radius in [500,1000,2000,3000,5000,7500,10000,15000]:
+        if radius>max(req.radius_m,10000 if req.property_type=='Local commercial' else 15000): continue
+        stages.append(radius)
+    for radius in stages:
+        tight=[c for c in cand if c['distance']<=radius and c['score']>=55 and .5 <= c['surface']/req.surface <= 1.75]
+        broad=[c for c in cand if c['distance']<=radius and c['score']>=42]
+        pool=tight if len(tight)>=3 else broad
+        if len(pool)>=3:
+            selected=sorted(pool,key=lambda c:(c['score'],str(c['date'])),reverse=True)[:15]
+            selection_stage=f'{radius} m'
+            break
+    if not selected and cand:
+        selected=sorted(cand,key=lambda c:(c['score'],str(c['date'])),reverse=True)[:15]
+        selection_stage='marché élargi'
     if not selected: return {'available':False,'geocode':geo,'comparables':[],'warning':'Aucune référence DVF PRO suffisamment comparable dans le périmètre.'}
     # Robustesse économique : médiane/MAD puis pondération non linéaire. Les extrêmes restent visibles mais ne pilotent pas la valeur.
     units=[float(c['price_per_m2']) for c in selected]; med=percentile(units,.5) or 0
@@ -411,7 +421,7 @@ async def _pro_market_analysis(req: ProEstimateRequest) -> dict[str, Any]:
     if any(c.get('economic_alert') for c in selected): alerts.append('Une ou plusieurs références économiques atypiques ont été fortement sous-pondérées.')
     return {'available':True,'geocode':geo,'unit_value':round(unit),'value':round(value),'confidence':conf,'comparables':selected,
             'stats':{'median_unit':round(med),'cv':round(cv,3),'recent_24m':recent,'count':len(selected),'effective_count':used},
-            'alerts':alerts,'source':{'years_loaded':[int(x.name.split('_')[1]) for x in files],'years_missing':missing,'sales_scanned':len(sales)}}
+            'alerts':alerts,'selection_stage':selection_stage,'source':{'years_loaded':[int(x.name.split('_')[1]) for x in files],'years_missing':missing,'sales_scanned':len(sales)}}
 
 
 @app.post('/api/pro-estimate')
