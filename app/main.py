@@ -35,7 +35,7 @@ DVF_BASE = "https://files.data.gouv.fr/geo-dvf/latest/csv"
 DVF_CACHE_MAX_AGE_DAYS = int(os.getenv("DVF_CACHE_MAX_AGE_DAYS", "7"))
 DVF_SYNC_INTERVAL_HOURS = int(os.getenv("DVF_SYNC_INTERVAL_HOURS", "24"))
 
-app = FastAPI(title="PUIG VALUE WEB", version="3.0.0")
+app = FastAPI(title="PUIG VALUE WEB", version="3.1.0")
 
 # ============================================================
 # PUIG VALUE V2.4 - AUTHENTIFICATION PRIVEE
@@ -282,6 +282,10 @@ class ProEstimateRequest(BaseModel):
     finance_costs: float = Field(default=0, ge=0, le=1000000000)
     taxes_costs: float = Field(default=0, ge=0, le=1000000000)
     target_margin_rate: float = Field(default=0.15, ge=0, le=0.60)
+    radius_m: int = Field(default=3000, ge=100, le=10000)
+    surface_tolerance: float = Field(default=0.35, ge=0.10, le=1.00)
+    years: list[int] = Field(default_factory=lambda: [2022, 2023, 2024, 2025])
+    excluded_comparable_ids: list[str] = Field(default_factory=list)
 
 
 def _pro_reconcile(methods: list[dict[str, Any]]) -> tuple[float, float, float, int]:
@@ -298,71 +302,179 @@ def _pro_reconcile(methods: list[dict[str, Any]]) -> tuple[float, float, float, 
     return central, central*(1-spread), central*(1+spread), round(confidence)
 
 
+def _pro_rows(paths: list[Path], property_type: str) -> list[dict[str, Any]]:
+    """Construit des références DVF adaptées aux actifs PRO, mutation par mutation."""
+    groups: dict[str, list[dict[str, str]]] = {}
+    for path in paths:
+        with path.open('r', encoding='utf-8-sig', newline='') as f:
+            for row in csv.DictReader(f):
+                if row.get('nature_mutation') != 'Vente':
+                    continue
+                mid=row.get('id_mutation') or ''
+                if mid: groups.setdefault(mid, []).append(row)
+    out=[]
+    for mid, rows in groups.items():
+        r0=rows[0]; price=fnum(r0.get('valeur_fonciere')); lat=fnum(r0.get('latitude')); lon=fnum(r0.get('longitude'))
+        if not price or not lat or not lon or price < 5000 or price > 100_000_000: continue
+        locals_seen=set(); res_surface=0.; commercial_surface=0.; res_units=0; commercial_units=0
+        for r in rows:
+            local_id=(r.get('id_local') or r.get('id_parcelle') or '', r.get('type_local') or '', r.get('surface_reelle_bati') or '')
+            if local_id in locals_seen: continue
+            locals_seen.add(local_id)
+            typ=r.get('type_local') or ''; surf=fnum(r.get('surface_reelle_bati'))
+            if typ in {'Maison','Appartement'} and surf>0: res_surface+=surf; res_units+=1
+            if typ == 'Local industriel. commercial ou assimilé' and surf>0: commercial_surface+=surf; commercial_units+=1
+        land=max([fnum(r.get('surface_terrain')) for r in rows] or [0])
+        addr=' '.join(x for x in [r0.get('adresse_numero') or '',r0.get('adresse_suffixe') or '',r0.get('adresse_nom_voie') or ''] if x).strip()
+        if property_type=='Local commercial':
+            if commercial_surface<=0: continue
+            surface=commercial_surface
+        elif property_type=='Immeuble de rapport':
+            # On vise les ventes en bloc comportant au moins deux logements.
+            if res_units < 2 or res_surface<=0: continue
+            surface=res_surface
+        else:
+            # Terrain : mutation sans bâti significatif et avec surface de terrain exploitable.
+            if (res_surface+commercial_surface)>0 or land<=0: continue
+            surface=land
+        unit=price/surface if surface else 0
+        if unit<=0 or unit>50000: continue
+        out.append({'id_mutation':mid,'date':r0.get('date_mutation') or '','price':price,'surface':surface,'land':land,
+                    'units':res_units if property_type=='Immeuble de rapport' else commercial_units,'lat':lat,'lon':lon,
+                    'address':addr,'commune':r0.get('nom_commune') or '','postcode':r0.get('code_postal') or '',
+                    'parcel':r0.get('id_parcelle') or '','price_per_m2':unit})
+    return out
+
+
+def _pro_comp_score(req: ProEstimateRequest, sale: dict[str, Any], distance: float) -> float:
+    # Score explicable : micro-localisation, gabarit, récence, puis critères spécifiques.
+    ds=distance_score(distance)
+    ss=surface_score(req.surface, sale['surface'])
+    ts=age_score(age_months(sale['date']))
+    specific=100.
+    if req.property_type=='Immeuble de rapport' and req.units and sale.get('units'):
+        specific=max(35.,100.-abs(req.units-sale['units'])*12.)
+    if req.property_type=='Terrain' and req.surface and sale.get('land'):
+        specific=surface_score(req.surface,sale['land'])
+    return max(0.,min(100.,.38*ds+.32*ss+.20*ts+.10*specific))
+
+
+async def _pro_market_analysis(req: ProEstimateRequest) -> dict[str, Any]:
+    geo=await geocode_address(req.address); citycode=geo['citycode']; files=[]; missing=[]
+    for y in req.years:
+        try: files.append(await ensure_dvf_file(y,citycode))
+        except FileNotFoundError: missing.append(y)
+    if not files: return {'available':False,'comparables':[],'warning':'Aucun fichier DVF disponible pour cette commune.'}
+    sales=_pro_rows(files,req.property_type); cand=[]
+    excluded=set(req.excluded_comparable_ids or [])
+    for sale in sales:
+        if sale.get('id_mutation') in excluded: continue
+        d=haversine(geo['lat'],geo['lon'],sale['lat'],sale['lon'])
+        if d>req.radius_m: continue
+        ratio=sale['surface']/req.surface if req.surface else 0
+        # Tolérance de gabarit progressive : on garde les candidats plus larges mais leur score les pénalise.
+        if ratio < max(.25,1-req.surface_tolerance*2) or ratio > 1+req.surface_tolerance*2: continue
+        sc=_pro_comp_score(req,sale,d)
+        cand.append({**sale,'distance':round(d,1),'months':age_months(sale['date']),'score':round(sc,1),'price_per_m2':round(sale['price_per_m2'],0)})
+    # EVS : d'abord segment/gabarit et pertinence, avec priorité aux mutations récentes.
+    cand.sort(key=lambda c:(str(c['date']),c['score']),reverse=True)
+    selected=[]
+    for radius in [250,500,750,1000,1500,2000,3000,5000,10000]:
+        if radius>req.radius_m: break
+        pool=[c for c in cand if c['distance']<=radius and c['score']>=55]
+        if len(pool)>=4 or radius==req.radius_m:
+            selected=pool[:12]; break
+    if not selected: selected=[c for c in cand if c['score']>=45][:10]
+    if not selected: return {'available':False,'geocode':geo,'comparables':[],'warning':'Aucune référence DVF PRO suffisamment comparable dans le périmètre.'}
+    # Robustesse économique : médiane/MAD puis pondération non linéaire. Les extrêmes restent visibles mais ne pilotent pas la valeur.
+    units=[float(c['price_per_m2']) for c in selected]; med=percentile(units,.5) or 0
+    absdev=[abs(x-med) for x in units]; mad=percentile(absdev,.5) or 0
+    num=den=0.; used=0
+    for c in selected:
+        econ=1.0
+        if mad>0:
+            z=abs(c['price_per_m2']-med)/(1.4826*mad)
+            if z>3.5: econ=.15; c['economic_alert']='Valeur extrême'
+            elif z>2.5: econ=.45; c['economic_alert']='Valeur atypique'
+        w=(c['score']/100)**4*econ
+        c['weight']=round(w,4); c['adjusted_value']=round(c['price_per_m2']*req.surface)
+        num+=c['price_per_m2']*w; den+=w
+        if w>.05: used+=1
+    unit=num/den if den else med; value=unit*req.surface
+    mean=sum(units)/len(units); sd=(sum((x-mean)**2 for x in units)/len(units))**.5 if units else 0; cv=sd/mean if mean else 1
+    avgscore=sum(c['score'] for c in selected)/len(selected); recent=sum(1 for c in selected if c['months']<=24)
+    conf=round(max(40,min(92,45+min(18,len(selected)*2)+avgscore*.22+min(8,recent*2)-min(18,cv*55))))
+    alerts=[]
+    if len(selected)<4: alerts.append('Moins de 4 références PRO significatives.')
+    if recent<2: alerts.append('Peu de références N/N-1 : contrôler l’évolution du marché.')
+    if cv>.30: alerts.append('Dispersion élevée des valeurs unitaires : segmentation expert nécessaire.')
+    if any(c.get('economic_alert') for c in selected): alerts.append('Une ou plusieurs références économiques atypiques ont été fortement sous-pondérées.')
+    return {'available':True,'geocode':geo,'unit_value':round(unit),'value':round(value),'confidence':conf,'comparables':selected,
+            'stats':{'median_unit':round(med),'cv':round(cv,3),'recent_24m':recent,'count':len(selected),'effective_count':used},
+            'alerts':alerts,'source':{'years_loaded':[int(x.name.split('_')[1]) for x in files],'years_missing':missing,'sales_scanned':len(sales)}}
+
+
 @app.post('/api/pro-estimate')
 async def pro_estimate(req: ProEstimateRequest):
-    methods=[]; warnings=[]; details={}
+    methods=[]; warnings=[]; details={}; market_analysis=None
+    use_market=req.valuation_method in {'Comparaison','Recoupement'}
+    use_income=req.valuation_method in {'Capitalisation','Recoupement'}
+    use_residual=req.valuation_method in {'Bilan résiduel','Recoupement'}
     market_value=None
-    use_market = req.valuation_method in {'Comparaison','Recoupement'}
-    use_income = req.valuation_method in {'Capitalisation','Recoupement'}
-    use_residual = req.valuation_method in {'Bilan résiduel','Recoupement'}
-    if use_market and req.market_unit_value:
-        market_value=req.surface*req.market_unit_value
-        methods.append({'name':'Approche par le marché', 'model':'Comparaison par unité de valeur', 'value':market_value, 'weight':0.60})
-        details['market']={'unit_value':req.market_unit_value,'surface':req.surface,'value':market_value}
-
+    if use_market:
+        market_analysis=await _pro_market_analysis(req)
+        details['market_analysis']=market_analysis
+        auto_unit=market_analysis.get('unit_value') if market_analysis.get('available') else None
+        chosen_unit=req.market_unit_value or auto_unit
+        if chosen_unit:
+            market_value=req.surface*chosen_unit
+            weight=.70 if market_analysis.get('confidence',0)>=75 else .58 if market_analysis.get('confidence',0)>=60 else .45
+            methods.append({'name':'Approche par le marché','model':'Comparaison DVF PRO pondérée' if auto_unit else 'Comparaison par unité de valeur expert','value':market_value,'weight':weight,
+                            'unit_value':round(chosen_unit),'automatic_unit_value':auto_unit,'expert_override':bool(req.market_unit_value)})
+            details['market']={'unit_value':chosen_unit,'surface':req.surface,'value':market_value,'automatic_unit_value':auto_unit}
+        else: warnings.append(market_analysis.get('warning') or 'Approche par le marché non calculable faute de références.')
+        warnings.extend(market_analysis.get('alerts') or [])
     if req.property_type in {'Local commercial','Immeuble de rapport'} and use_income:
         rent=req.annual_rent_potential if (req.property_type=='Immeuble de rapport' and req.annual_rent_potential) else req.annual_rent
         if rent and req.cap_rate:
-            effective_rent=rent*(1-req.vacancy_rate)
-            noi=max(0,effective_rent-req.annual_charges_owner)
-            income_value=noi/req.cap_rate
-            income_weight=0.65 if req.property_type=='Local commercial' else 0.60
-            methods.append({'name':'Approche par le revenu','model':'Capitalisation directe du revenu net','value':income_value,'weight':income_weight})
+            effective_rent=rent*(1-req.vacancy_rate); noi=max(0,effective_rent-req.annual_charges_owner); income_value=noi/req.cap_rate
+            iw=.70 if req.property_type=='Local commercial' else .65
+            methods.append({'name':'Approche par le revenu','model':'Capitalisation directe du revenu net','value':income_value,'weight':iw})
             details['income']={'rent':rent,'effective_rent':effective_rent,'noi':noi,'cap_rate':req.cap_rate,'value':income_value}
-        else:
-            warnings.append('Approche par le revenu non calculée : loyer et/ou taux de capitalisation manquant.')
-        if req.property_type=='Local commercial':
-            # Market remains a useful cross-check, not automatically equal weight.
-            for m in methods:
-                if m['name']=='Approche par le marché': m['weight']=0.35 if any(x['name']=='Approche par le revenu' for x in methods) else 1.0
-        else:
-            for m in methods:
-                if m['name']=='Approche par le marché': m['weight']=0.40 if any(x['name']=='Approche par le revenu' for x in methods) else 1.0
-
+        else: warnings.append('Approche par le revenu non calculée : loyer et/ou taux de capitalisation manquant.')
     if req.property_type=='Terrain' and use_residual:
         residual=None
         if req.projected_revenue and req.projected_revenue>0:
             target_margin=req.projected_revenue*req.target_margin_rate
             residual=req.projected_revenue-req.works_cost-req.soft_costs-req.finance_costs-req.taxes_costs-target_margin
             if residual>0:
-                methods.append({'name':'Approche par le coût / projet','model':'Bilan promoteur résiduel','value':residual,'weight':0.55})
+                methods.append({'name':'Approche résiduelle','model':'Bilan promoteur résiduel','value':residual,'weight':.70})
                 details['residual']={'projected_revenue':req.projected_revenue,'target_margin':target_margin,'costs':req.works_cost+req.soft_costs+req.finance_costs+req.taxes_costs,'value':residual}
-            else:
-                warnings.append('Le bilan promoteur aboutit à une charge foncière nulle ou négative : hypothèses à revoir.')
-        if market_value:
-            for m in methods:
-                if m['name']=='Approche par le marché': m['weight']=0.65 if residual is None else 0.45
-        if not req.buildable_area:
-            warnings.append('Surface constructible non renseignée : le contrôle de charge foncière par m² constructible est indisponible.')
-
-    central,low,high,conf=_pro_reconcile(methods)
-    # Coherence checks, not automatic value corrections.
+            else: warnings.append('Le bilan promoteur aboutit à une charge foncière nulle ou négative : hypothèses à revoir.')
+        if not req.buildable_area: warnings.append('Surface constructible non renseignée : contrôle de charge foncière/m² indisponible.')
+    # Repondération par pertinence : jamais 50/50 par réflexe.
     if len(methods)>1:
-        vals=[m['value'] for m in methods]
-        gap=(max(vals)-min(vals))/central
+        if req.property_type=='Local commercial':
+            for m in methods: m['weight']=.60 if m['name']=='Approche par le revenu' else .40
+        elif req.property_type=='Immeuble de rapport':
+            for m in methods: m['weight']=.60 if m['name']=='Approche par le revenu' else .40
+        elif req.property_type=='Terrain':
+            for m in methods: m['weight']=.60 if m['name']=='Approche par le marché' else .40
+    central,low,high,conf=_pro_reconcile(methods)
+    if market_analysis and market_analysis.get('confidence'):
+        conf=round((conf*0.55)+(market_analysis['confidence']*0.45))
+        spread=.06 if conf>=80 else .09 if conf>=70 else .12 if conf>=60 else .16
+        low,high=central*(1-spread),central*(1+spread)
+    if len(methods)>1:
+        vals=[m['value'] for m in methods]; gap=(max(vals)-min(vals))/central
         if gap>.25: warnings.append('Écart supérieur à 25 % entre méthodes : contrôle expert renforcé recommandé.')
     if req.property_type=='Terrain' and details.get('residual') and req.buildable_area:
         details['residual']['land_per_buildable_m2']=details['residual']['value']/req.buildable_area
-    return {
-        'module':'PUIG PRO', 'property_type':req.property_type, 'valuation_method':req.valuation_method, 'address':req.address,
-        'central':round(central), 'low':round(low), 'high':round(high), 'confidence':conf,
-        'methods':[{**m,'value':round(m['value'])} for m in methods], 'details':details, 'warnings':warnings,
-        'evs':{
-            'framework':'Approche → Méthode → Modèle → Jugement',
-            'rule':('Méthode sélectionnée : '+req.valuation_method+'. En mode Recoupement, les méthodes ne sont pas moyennées à poids égal : la méthode la plus pertinente au type d’actif domine.'),
-            'expert_control':'La valeur finale reste soumise au jugement de l’expert, à la visite et à la validation des hypothèses de marché.'
-        }
-    }
+    return {'module':'PUIG PRO','property_type':req.property_type,'valuation_method':req.valuation_method,'address':req.address,
+            'central':round(central),'low':round(low),'high':round(high),'confidence':conf,
+            'methods':[{**m,'value':round(m['value'])} for m in methods],'details':details,'warnings':warnings,
+            'comparables':(market_analysis or {}).get('comparables',[]),'market_analysis':market_analysis,
+            'evs':{'framework':'Approche → Méthode → Modèle → Jugement','rule':'Comparables PRO sélectionnés par segment, gabarit, récence, proximité et cohérence économique. Les méthodes sont recoupées selon leur pertinence, sans moyenne mécanique.','expert_control':'La conclusion reste soumise au jugement de l’expert, à la visite, aux baux et aux données urbanistiques/techniques.'}}
 
 def get_db():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
