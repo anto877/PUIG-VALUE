@@ -35,7 +35,7 @@ DVF_BASE = "https://files.data.gouv.fr/geo-dvf/latest/csv"
 DVF_CACHE_MAX_AGE_DAYS = int(os.getenv("DVF_CACHE_MAX_AGE_DAYS", "7"))
 DVF_SYNC_INTERVAL_HOURS = int(os.getenv("DVF_SYNC_INTERVAL_HOURS", "24"))
 
-app = FastAPI(title="PUIG VALUE WEB", version="2.8.0")
+app = FastAPI(title="PUIG VALUE WEB", version="2.9.0")
 
 # ============================================================
 # PUIG VALUE V2.4 - AUTHENTIFICATION PRIVEE
@@ -256,6 +256,109 @@ class EstimateRequest(BaseModel):
     nuisance: int = Field(default=0, ge=0, le=3)
     years: list[int] = Field(default_factory=lambda: [2021, 2022, 2023, 2024, 2025])
 
+
+
+class ProEstimateRequest(BaseModel):
+    address: str = Field(min_length=3, max_length=300)
+    property_type: str = Field(pattern="^(Local commercial|Immeuble de rapport|Terrain)$")
+    surface: float = Field(gt=0, le=100000)
+    market_unit_value: float | None = Field(default=None, gt=0, le=100000)
+    annual_rent: float | None = Field(default=None, ge=0, le=10000000)
+    annual_charges_owner: float = Field(default=0, ge=0, le=10000000)
+    vacancy_rate: float = Field(default=0.03, ge=0, le=0.50)
+    cap_rate: float | None = Field(default=None, gt=0.005, le=0.50)
+    occupancy: str = Field(default="Libre", max_length=100)
+    condition: int = Field(default=7, ge=1, le=10)
+    notes: str = Field(default="", max_length=5000)
+    # Immeuble de rapport
+    units: int = Field(default=0, ge=0, le=500)
+    annual_rent_potential: float | None = Field(default=None, ge=0, le=10000000)
+    # Terrain / bilan promoteur
+    buildable_area: float | None = Field(default=None, ge=0, le=500000)
+    projected_revenue: float | None = Field(default=None, ge=0, le=1000000000)
+    works_cost: float = Field(default=0, ge=0, le=1000000000)
+    soft_costs: float = Field(default=0, ge=0, le=1000000000)
+    finance_costs: float = Field(default=0, ge=0, le=1000000000)
+    taxes_costs: float = Field(default=0, ge=0, le=1000000000)
+    target_margin_rate: float = Field(default=0.15, ge=0, le=0.60)
+
+
+def _pro_reconcile(methods: list[dict[str, Any]]) -> tuple[float, float, float, int]:
+    valid=[m for m in methods if m.get('value') and m['value']>0]
+    if not valid:
+        raise HTTPException(422, "Renseignez au moins une méthode exploitable (comparaison, revenu ou bilan).")
+    # EVS : pas de moyenne mécanique. La méthode déclarée principale reçoit le poids dominant.
+    total=sum(m['weight'] for m in valid)
+    central=sum(m['value']*m['weight'] for m in valid)/total
+    vals=[m['value'] for m in valid]
+    disagreement=(max(vals)-min(vals))/central if len(vals)>1 and central else 0
+    confidence=max(45, min(90, 82 - disagreement*55 + min(8, len(valid)*3)))
+    spread=.07 if confidence>=80 else .10 if confidence>=70 else .13 if confidence>=60 else .17
+    return central, central*(1-spread), central*(1+spread), round(confidence)
+
+
+@app.post('/api/pro-estimate')
+async def pro_estimate(req: ProEstimateRequest):
+    methods=[]; warnings=[]; details={}
+    market_value=None
+    if req.market_unit_value:
+        market_value=req.surface*req.market_unit_value
+        methods.append({'name':'Approche par le marché', 'model':'Comparaison par unité de valeur', 'value':market_value, 'weight':0.60})
+        details['market']={'unit_value':req.market_unit_value,'surface':req.surface,'value':market_value}
+
+    if req.property_type in {'Local commercial','Immeuble de rapport'}:
+        rent=req.annual_rent_potential if (req.property_type=='Immeuble de rapport' and req.annual_rent_potential) else req.annual_rent
+        if rent and req.cap_rate:
+            effective_rent=rent*(1-req.vacancy_rate)
+            noi=max(0,effective_rent-req.annual_charges_owner)
+            income_value=noi/req.cap_rate
+            income_weight=0.65 if req.property_type=='Local commercial' else 0.60
+            methods.append({'name':'Approche par le revenu','model':'Capitalisation directe du revenu net','value':income_value,'weight':income_weight})
+            details['income']={'rent':rent,'effective_rent':effective_rent,'noi':noi,'cap_rate':req.cap_rate,'value':income_value}
+        else:
+            warnings.append('Approche par le revenu non calculée : loyer et/ou taux de capitalisation manquant.')
+        if req.property_type=='Local commercial':
+            # Market remains a useful cross-check, not automatically equal weight.
+            for m in methods:
+                if m['name']=='Approche par le marché': m['weight']=0.35 if any(x['name']=='Approche par le revenu' for x in methods) else 1.0
+        else:
+            for m in methods:
+                if m['name']=='Approche par le marché': m['weight']=0.40 if any(x['name']=='Approche par le revenu' for x in methods) else 1.0
+
+    if req.property_type=='Terrain':
+        residual=None
+        if req.projected_revenue and req.projected_revenue>0:
+            target_margin=req.projected_revenue*req.target_margin_rate
+            residual=req.projected_revenue-req.works_cost-req.soft_costs-req.finance_costs-req.taxes_costs-target_margin
+            if residual>0:
+                methods.append({'name':'Approche par le coût / projet','model':'Bilan promoteur résiduel','value':residual,'weight':0.55})
+                details['residual']={'projected_revenue':req.projected_revenue,'target_margin':target_margin,'costs':req.works_cost+req.soft_costs+req.finance_costs+req.taxes_costs,'value':residual}
+            else:
+                warnings.append('Le bilan promoteur aboutit à une charge foncière nulle ou négative : hypothèses à revoir.')
+        if market_value:
+            for m in methods:
+                if m['name']=='Approche par le marché': m['weight']=0.65 if residual is None else 0.45
+        if not req.buildable_area:
+            warnings.append('Surface constructible non renseignée : le contrôle de charge foncière par m² constructible est indisponible.')
+
+    central,low,high,conf=_pro_reconcile(methods)
+    # Coherence checks, not automatic value corrections.
+    if len(methods)>1:
+        vals=[m['value'] for m in methods]
+        gap=(max(vals)-min(vals))/central
+        if gap>.25: warnings.append('Écart supérieur à 25 % entre méthodes : contrôle expert renforcé recommandé.')
+    if req.property_type=='Terrain' and details.get('residual') and req.buildable_area:
+        details['residual']['land_per_buildable_m2']=details['residual']['value']/req.buildable_area
+    return {
+        'module':'PUIG PRO', 'property_type':req.property_type, 'address':req.address,
+        'central':round(central), 'low':round(low), 'high':round(high), 'confidence':conf,
+        'methods':[{**m,'value':round(m['value'])} for m in methods], 'details':details, 'warnings':warnings,
+        'evs':{
+            'framework':'Approche → Méthode → Modèle → Jugement',
+            'rule':'Les méthodes ne sont pas moyennées à poids égal : la méthode la plus pertinente au type d’actif domine le recoupement.',
+            'expert_control':'La valeur finale reste soumise au jugement de l’expert, à la visite et à la validation des hypothèses de marché.'
+        }
+    }
 
 def get_db():
     DATA_DIR.mkdir(parents=True, exist_ok=True)
