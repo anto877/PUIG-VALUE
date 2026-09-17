@@ -35,7 +35,7 @@ DVF_BASE = "https://files.data.gouv.fr/geo-dvf/latest/csv"
 DVF_CACHE_MAX_AGE_DAYS = int(os.getenv("DVF_CACHE_MAX_AGE_DAYS", "7"))
 DVF_SYNC_INTERVAL_HOURS = int(os.getenv("DVF_SYNC_INTERVAL_HOURS", "24"))
 
-app = FastAPI(title="PUIG VALUE WEB", version="2.9.0")
+app = FastAPI(title="PUIG VALUE WEB", version="3.0.0")
 
 # ============================================================
 # PUIG VALUE V2.4 - AUTHENTIFICATION PRIVEE
@@ -261,6 +261,7 @@ class EstimateRequest(BaseModel):
 class ProEstimateRequest(BaseModel):
     address: str = Field(min_length=3, max_length=300)
     property_type: str = Field(pattern="^(Local commercial|Immeuble de rapport|Terrain)$")
+    valuation_method: str = Field(default="Recoupement", pattern="^(Comparaison|Capitalisation|Bilan résiduel|Recoupement)$")
     surface: float = Field(gt=0, le=100000)
     market_unit_value: float | None = Field(default=None, gt=0, le=100000)
     annual_rent: float | None = Field(default=None, ge=0, le=10000000)
@@ -301,12 +302,15 @@ def _pro_reconcile(methods: list[dict[str, Any]]) -> tuple[float, float, float, 
 async def pro_estimate(req: ProEstimateRequest):
     methods=[]; warnings=[]; details={}
     market_value=None
-    if req.market_unit_value:
+    use_market = req.valuation_method in {'Comparaison','Recoupement'}
+    use_income = req.valuation_method in {'Capitalisation','Recoupement'}
+    use_residual = req.valuation_method in {'Bilan résiduel','Recoupement'}
+    if use_market and req.market_unit_value:
         market_value=req.surface*req.market_unit_value
         methods.append({'name':'Approche par le marché', 'model':'Comparaison par unité de valeur', 'value':market_value, 'weight':0.60})
         details['market']={'unit_value':req.market_unit_value,'surface':req.surface,'value':market_value}
 
-    if req.property_type in {'Local commercial','Immeuble de rapport'}:
+    if req.property_type in {'Local commercial','Immeuble de rapport'} and use_income:
         rent=req.annual_rent_potential if (req.property_type=='Immeuble de rapport' and req.annual_rent_potential) else req.annual_rent
         if rent and req.cap_rate:
             effective_rent=rent*(1-req.vacancy_rate)
@@ -325,7 +329,7 @@ async def pro_estimate(req: ProEstimateRequest):
             for m in methods:
                 if m['name']=='Approche par le marché': m['weight']=0.40 if any(x['name']=='Approche par le revenu' for x in methods) else 1.0
 
-    if req.property_type=='Terrain':
+    if req.property_type=='Terrain' and use_residual:
         residual=None
         if req.projected_revenue and req.projected_revenue>0:
             target_margin=req.projected_revenue*req.target_margin_rate
@@ -350,12 +354,12 @@ async def pro_estimate(req: ProEstimateRequest):
     if req.property_type=='Terrain' and details.get('residual') and req.buildable_area:
         details['residual']['land_per_buildable_m2']=details['residual']['value']/req.buildable_area
     return {
-        'module':'PUIG PRO', 'property_type':req.property_type, 'address':req.address,
+        'module':'PUIG PRO', 'property_type':req.property_type, 'valuation_method':req.valuation_method, 'address':req.address,
         'central':round(central), 'low':round(low), 'high':round(high), 'confidence':conf,
         'methods':[{**m,'value':round(m['value'])} for m in methods], 'details':details, 'warnings':warnings,
         'evs':{
             'framework':'Approche → Méthode → Modèle → Jugement',
-            'rule':'Les méthodes ne sont pas moyennées à poids égal : la méthode la plus pertinente au type d’actif domine le recoupement.',
+            'rule':('Méthode sélectionnée : '+req.valuation_method+'. En mode Recoupement, les méthodes ne sont pas moyennées à poids égal : la méthode la plus pertinente au type d’actif domine.'),
             'expert_control':'La valeur finale reste soumise au jugement de l’expert, à la visite et à la validation des hypothèses de marché.'
         }
     }
